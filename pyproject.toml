@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "braven"
+version = "0.1.0"
+description = "Python SDK for the Braven experiment tracker"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Braven" }]
+dependencies = ["requests>=2.28"]
+
+[project.urls]
+Homepage = "https://github.com/bravenlab/braven-python"
+Issues = "https://github.com/bravenlab/braven-python/issues"
+Documentation = "https://docs.bravenlab.com"
+
+[project.optional-dependencies]
+dataframe = ["pandas>=1.5"]
+plots = ["matplotlib>=3.5", "Pillow>=9.0"]
+
+[tool.hatch.build.targets.wheel]
+# Single-file module — no package/src-layout restructuring of the public
+# API surface (`import braven` stays exactly what it is today).
+include = ["braven.py"]
+
+[dependency-groups]
+dev = ["pytest>=7.0", "matplotlib>=3.5", "Pillow>=9.0", "numpy>=1.24"]
