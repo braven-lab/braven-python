@@ -72,6 +72,8 @@ if hasattr(sys.stdout, "reconfigure"):
 # ---------------------------------------------------------------------------
 
 _CONFIG_PATH = Path.home() / ".braven" / "config.json"
+_DEFAULT_API_URL = "https://api.bravenlab.com"
+_SETTINGS_URL = "https://app.bravenlab.com/app/settings"
 
 
 def login(api_url: str, api_key: str) -> None:
@@ -83,13 +85,39 @@ def login(api_url: str, api_key: str) -> None:
     )
 
 
+def _prompt_login() -> dict:
+    """wandb-style first-use prompt (wandb.init() does the same thing when
+    you're not logged in): asks for a Watcher Key right here instead of
+    crashing, so a fresh `pip install braven` only ever needs one
+    braven.init(...)/collect(...) call — no separate `python -m braven
+    login` step first. Only reached when stdin is a real terminal (see
+    _load_config) — there's nobody to answer this in CI or a piped script."""
+    print("You're not logged in to Braven yet.")
+    print(f'Get your Watcher Key from {_SETTINGS_URL} (under "Watcher Keys" -> Generate Key).')
+    api_key = getpass.getpass("Paste your Watcher Key (braven_...): ").strip()
+    if not api_key:
+        raise RuntimeError(
+            "No API key entered — not logged in.\n"
+            "Run:  python -m braven login\n"
+            "Or:   braven.login(api_url, api_key)"
+        )
+    login(_DEFAULT_API_URL, api_key)
+    print(f"Logged in. Credentials saved to {_CONFIG_PATH}\n")
+    return {"api_url": _DEFAULT_API_URL, "api_key": api_key}
+
+
 def _load_config() -> dict:
-    """Return stored credentials, or raise a helpful RuntimeError."""
+    """Return stored credentials. If none are saved yet, prompts once
+    (wandb-style — see _prompt_login) when running interactively; raises a
+    clear instruction otherwise (CI, a piped/redirected script, a notebook
+    kernel with no real stdin)."""
     if not _CONFIG_PATH.exists():
+        if sys.stdin.isatty():
+            return _prompt_login()
         raise RuntimeError(
             "Not logged in to Braven.\n"
             "Run:  python -m braven login\n"
-            "Or:   braven.login(api_url, api_key, project_id)"
+            "Or:   braven.login(api_url, api_key)"
         )
     try:
         return json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
@@ -1608,7 +1636,7 @@ def _cli_login() -> None:
         except Exception:
             pass
 
-    default_url = existing.get("api_url", "https://api.bravenlab.com")
+    default_url = existing.get("api_url", _DEFAULT_API_URL)
     raw_url = input(f"API URL [{default_url}]: ").strip().rstrip("/")
     api_url = raw_url if raw_url else default_url
 

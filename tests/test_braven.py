@@ -8,11 +8,15 @@ the private braven-mvp repo, which these preview-generation tests are ported
 from.
 
 Out of scope (per the spec): anything that hits the network — Run, Device,
-Braven (query client), Analysis, collect(), login()/_load_config().
+Braven (query client), Analysis, collect(). login()/_load_config() are pure
+filesystem + stdin, so their branching (interactive prompt vs. non-interactive
+error, per the wandb-style first-use flow) is covered below with a monkeypatched
+_CONFIG_PATH — never your real ~/.braven/config.json.
 """
 
 import io
 import json
+import sys
 import tempfile
 from pathlib import Path
 
@@ -21,6 +25,7 @@ import matplotlib
 matplotlib.use("Agg")  # headless — no display needed to run these tests
 import matplotlib.pyplot as plt
 import numpy as np
+import pytest
 from PIL import Image
 
 import braven
@@ -267,3 +272,63 @@ def test_build_plot_series_entries_coerces_numpy_values():
     )
     y_value = json.loads(entries[0][1])
     assert y_value == [1.5, 2.5]
+
+
+# ---------------------------------------------------------------------------
+# _load_config / _prompt_login — wandb-style first-use login prompt.
+# Every test redirects braven._CONFIG_PATH into pytest's tmp_path, so none of
+# these ever touch the real ~/.braven/config.json.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def isolated_config_path(tmp_path, monkeypatch):
+    path = tmp_path / ".braven" / "config.json"
+    monkeypatch.setattr(braven, "_CONFIG_PATH", path)
+    return path
+
+
+def test_load_config_reads_an_existing_file(isolated_config_path):
+    isolated_config_path.parent.mkdir(parents=True)
+    isolated_config_path.write_text(json.dumps({"api_url": "https://example.com", "api_key": "braven_abc"}))
+
+    assert braven._load_config() == {"api_url": "https://example.com", "api_key": "braven_abc"}
+
+
+def test_load_config_raises_a_clear_error_on_corrupted_json(isolated_config_path):
+    isolated_config_path.parent.mkdir(parents=True)
+    isolated_config_path.write_text("not json")
+
+    with pytest.raises(RuntimeError, match="Corrupted credentials file"):
+        braven._load_config()
+
+
+def test_load_config_raises_when_missing_and_non_interactive(isolated_config_path, monkeypatch):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+
+    with pytest.raises(RuntimeError, match="Not logged in"):
+        braven._load_config()
+    assert not isolated_config_path.exists()
+
+
+def test_load_config_prompts_and_persists_when_missing_and_interactive(isolated_config_path, monkeypatch):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(braven.getpass, "getpass", lambda _prompt: "braven_pasted_key")
+
+    cfg = braven._load_config()
+
+    assert cfg == {"api_url": braven._DEFAULT_API_URL, "api_key": "braven_pasted_key"}
+    assert json.loads(isolated_config_path.read_text()) == cfg
+    # A second call reads the now-saved file back rather than prompting again
+    # (an isatty()/getpass patched to raise would fail this call if it did).
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: (_ for _ in ()).throw(AssertionError("should not re-prompt")))
+    assert braven._load_config() == cfg
+
+
+def test_load_config_raises_when_interactive_prompt_left_blank(isolated_config_path, monkeypatch):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(braven.getpass, "getpass", lambda _prompt: "  ")
+
+    with pytest.raises(RuntimeError, match="No API key entered"):
+        braven._load_config()
+    assert not isolated_config_path.exists()
