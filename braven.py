@@ -868,6 +868,54 @@ params: dict = {}
 column_maps: dict[str, str] = {}
 
 
+# ---------------------------------------------------------------------------
+# Local dry mode — pipeline scripts are normally written and iterated on
+# locally (`python script.py`) before being copy-pasted into the webapp
+# Pipeline editor. Historically, any pipeline-vocabulary call
+# (log_config/log_summary/log_series/log_artifact/upload/plot_series/
+# device()) raised RuntimeError the moment it ran outside the worker, since
+# nothing had configured an experiment/API context — breaking that
+# copy-paste loop. Now, when _ensure_pipeline_init() finds NEITHER
+# braven_experiment_id NOR braven_api_url resolvable (not via explicit
+# args, not via BRAVEN_* env vars), it returns ("", "") instead of raising,
+# and every write function below prints what it would have done instead.
+#
+# This can never fire inside a real worker run: worker/executor.py always
+# calls braven.init(experiment_id=..., api_url=..., ...) with explicit
+# keyword arguments before user code executes, and explicit arguments
+# already take precedence over every other source in init_pipeline()'s
+# resolution order. A *partially* configured context (one field resolves,
+# the other doesn't) is left alone — that's a real misconfiguration, not a
+# local script, and still raises exactly as before.
+#
+# See braven-mvp's docs/adr/0008-local-pipeline-dry-mode.md and
+# .scratch/local-pipeline-dry-mode/spec.md for the full design.
+# ---------------------------------------------------------------------------
+
+_LOCAL_OUTPUT_DIR = "braven_local_output"
+
+_CATEGORY_TO_LOG_FN = {"config": "log_config", "summary": "log_summary", "series": "log_series"}
+
+
+def _local_output_path(filename: str) -> Path:
+    """Next available path under ./braven_local_output/ for `filename`,
+    appending a numeric suffix on collision (figure_1.png, figure_2.png,
+    ...) rather than overwriting a previous local run's output — local
+    iteration commonly re-runs the same script repeatedly."""
+    out_dir = Path(_LOCAL_OUTPUT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    candidate = out_dir / filename
+    if not candidate.exists():
+        return candidate
+    stem, suffix = candidate.stem, candidate.suffix
+    n = 1
+    while True:
+        candidate = out_dir / f"{stem}_{n}{suffix}"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
 class _PipelineRun:
     """Run handle returned by braven.init() inside a worker-run pipeline. Its
     logging methods delegate to the module-level pipeline metadata queue, and
@@ -940,8 +988,20 @@ def init_pipeline(
 
 
 def _ensure_pipeline_init() -> tuple[str, str]:
+    """Resolve the pipeline execution context, calling init_pipeline() first
+    to pick up BRAVEN_* env vars if nothing's set yet.
+
+    Returns (experiment_id, api_url) when a context is configured. Returns
+    ("", "") — local dry mode, see the section above — only when NEITHER
+    field resolves to anything; callers must check the returned
+    experiment_id and, if empty, print instead of making a network call. A
+    partially-configured context (one field resolves, the other doesn't)
+    is a real misconfiguration, not a local script, and still raises.
+    """
     if not braven_experiment_id or not braven_api_url:
         init_pipeline()
+    if not braven_experiment_id and not braven_api_url:
+        return "", ""
     if not braven_experiment_id:
         raise RuntimeError(
             "braven experiment_id not set. The worker should have called braven.init_pipeline(), "
@@ -1039,7 +1099,12 @@ def _pipeline_plot_series(
 
 
 def _pipeline_log(key: str, value: str, category: str, device_key: str | None = None, device_type: str | None = None) -> None:
-    _ensure_pipeline_init()
+    experiment_id, _api_url = _ensure_pipeline_init()
+    if not experiment_id:  # local dry mode — see the section above
+        fn = _CATEGORY_TO_LOG_FN.get(category, "log_config")
+        suffix = f", device={device_key!r}" if device_key else ""
+        print(f"[braven:local] would {fn}({key!r}, {value!r}{suffix})", flush=True)
+        return
     global _metadata_queue
     # Dedup by (key, device_key): a device's value only replaces the same device's
     # earlier value for that key, never another device's (Spec 04 long format).
@@ -1070,10 +1135,13 @@ def flush_metadata(pipeline_id: str | None = None) -> dict | None:
     createdTypeNames, typeMismatches}) so the worker can fold it into the run
     result, and prints a human line to stdout when the run created/flagged
     devices. Returns None when there's nothing to flush."""
+    experiment_id, api_url = _ensure_pipeline_init()
+    if not experiment_id:  # local dry mode — see the section above
+        print("[braven:local] flush_metadata() — nothing to flush (local dry mode)", flush=True)
+        return None
     entries = list(_metadata_queue)
     if not entries:
         return None
-    experiment_id, api_url = _ensure_pipeline_init()
     pid = pipeline_id or braven_pipeline_id
     if not pid:
         raise RuntimeError("flush_metadata: pipeline_id is required")
@@ -1113,20 +1181,30 @@ def _pipeline_upload(path_or_fig, name: str | None = None) -> None:
     interactive companion series is extracted from the figure's line/scatter
     data (best-effort — queued as series metadata and written by the final
     flush_metadata(), never blocking the upload itself)."""
-    experiment_id, api_url = _ensure_pipeline_init()
-
     fig = path_or_fig if _is_matplotlib_figure(path_or_fig) else None
-    tmp_path: Path | None = None
     if fig is not None:
-        tmp_path = Path(tempfile.mktemp(suffix=".png"))
-        fig.savefig(tmp_path, dpi=150, bbox_inches="tight")
-        file_path = tmp_path
         upload_name = name or "figure.png"
     else:
         file_path = Path(path_or_fig)
         if not file_path.exists():
             raise FileNotFoundError(f"upload: file not found: {file_path}")
         upload_name = name or file_path.name
+
+    experiment_id, api_url = _ensure_pipeline_init()
+    if not experiment_id:  # local dry mode — see the section above
+        if fig is not None:
+            out_path = _local_output_path(upload_name)
+            fig.savefig(out_path, dpi=150, bbox_inches="tight")
+            print(f"[braven:local] saved figure to {out_path} (upload skipped)", flush=True)
+        else:
+            print(f"[braven:local] would upload({upload_name!r})", flush=True)
+        return
+
+    tmp_path: Path | None = None
+    if fig is not None:
+        tmp_path = Path(tempfile.mktemp(suffix=".png"))
+        fig.savefig(tmp_path, dpi=150, bbox_inches="tight")
+        file_path = tmp_path
 
     params: dict = {"experiment_id": experiment_id}
     if braven_pipeline_id:
@@ -1171,11 +1249,16 @@ def _pipeline_upload(path_or_fig, name: str | None = None) -> None:
 
 def log_artifact(path: Union[str, Path], name: str | None = None) -> None:
     """Upload a file attached to the current pipeline experiment."""
-    experiment_id, api_url = _ensure_pipeline_init()
     file_path = Path(path)
     if not file_path.exists():
         raise FileNotFoundError(f"log_artifact: file not found: {file_path}")
     upload_name = name or file_path.name
+
+    experiment_id, api_url = _ensure_pipeline_init()
+    if not experiment_id:  # local dry mode — see the section above
+        print(f"[braven:local] would log_artifact({upload_name!r})", flush=True)
+        return
+
     params: dict = {"experiment_id": experiment_id}
     if braven_pipeline_id:
         params["pipeline_id"] = braven_pipeline_id

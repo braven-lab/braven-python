@@ -332,3 +332,175 @@ def test_load_config_raises_when_interactive_prompt_left_blank(isolated_config_p
     with pytest.raises(RuntimeError, match="No API key entered"):
         braven._load_config()
     assert not isolated_config_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Local dry mode (docs/adr/0008-local-pipeline-dry-mode.md in braven-mvp) —
+# pipeline-vocabulary calls with no configured context print instead of
+# raising or touching the network. Every test resets the module-level
+# pipeline-context globals (they're process-wide state, not per-Run) and
+# asserts no HTTP call was ever attempted, since "doesn't raise" alone
+# wouldn't catch a version that silently degrades into a real network call
+# instead of a true no-op.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def reset_pipeline_context(monkeypatch):
+    """Isolates each test from real BRAVEN_* env vars and resets braven.py's
+    module-level pipeline/direct-run context before and after, so tests
+    can't leak state into each other via shared module globals."""
+    for var in ("BRAVEN_EXPERIMENT_ID", "BRAVEN_API_URL", "BRAVEN_WATCHER_SECRET", "WATCHER_SECRET", "BRAVEN_USER_ID"):
+        monkeypatch.delenv(var, raising=False)
+
+    def _clear():
+        monkeypatch.setattr(braven, "braven_experiment_id", None)
+        monkeypatch.setattr(braven, "braven_api_url", None)
+        monkeypatch.setattr(braven, "braven_watcher_secret", None)
+        monkeypatch.setattr(braven, "braven_user_id", None)
+        monkeypatch.setattr(braven, "braven_pipeline_id", None)
+        monkeypatch.setattr(braven, "_metadata_queue", [])
+        monkeypatch.setattr(braven, "params", {})
+        monkeypatch.setattr(braven, "column_maps", {})
+        monkeypatch.setattr(braven, "_pipeline_run", None)
+        monkeypatch.setattr(braven, "_current_run", None)
+
+    _clear()
+    yield
+    _clear()
+
+
+def _no_network(monkeypatch):
+    """Fails the test immediately if braven.py makes any real HTTP call —
+    local dry mode must never reach the network."""
+    def _boom(*args, **kwargs):
+        raise AssertionError(f"unexpected network call: args={args} kwargs={kwargs}")
+    monkeypatch.setattr(braven.requests, "post", _boom)
+    monkeypatch.setattr(braven.requests, "put", _boom)
+    monkeypatch.setattr(braven.requests, "get", _boom)
+
+
+def test_log_config_with_no_context_prints_instead_of_raising(reset_pipeline_context, monkeypatch, capsys):
+    _no_network(monkeypatch)
+
+    braven.log_config("lr", "0.001")  # must not raise
+
+    out = capsys.readouterr().out
+    assert "[braven:local] would log_config('lr', '0.001')" in out
+    assert braven._metadata_queue == []  # nothing queued in local mode
+
+
+def test_log_summary_with_no_context_prints_instead_of_raising(reset_pipeline_context, monkeypatch, capsys):
+    _no_network(monkeypatch)
+
+    braven.log_summary("acc", "0.94")
+
+    assert "would log_summary('acc', '0.94')" in capsys.readouterr().out
+
+
+def test_log_series_with_no_context_prints_instead_of_raising(reset_pipeline_context, monkeypatch, capsys):
+    _no_network(monkeypatch)
+
+    braven.log_series("temperature", [1.0, 2.0, 3.0])
+
+    assert "would log_series" in capsys.readouterr().out
+
+
+def test_device_logging_with_no_context_prints_and_tags_device(reset_pipeline_context, monkeypatch, capsys):
+    _no_network(monkeypatch)
+
+    braven.device("SENSOR-1").log_summary("SNR", 14.2)
+
+    assert "would log_summary('SNR', '14.2', device='SENSOR-1')" in capsys.readouterr().out
+
+
+def test_flush_metadata_with_no_context_is_a_noop_print(reset_pipeline_context, monkeypatch, capsys):
+    _no_network(monkeypatch)
+
+    result = braven.flush_metadata(pipeline_id="pipe_1")
+
+    assert result is None
+    assert "flush_metadata() — nothing to flush (local dry mode)" in capsys.readouterr().out
+
+
+def test_log_artifact_with_no_context_prints_instead_of_raising(reset_pipeline_context, monkeypatch, capsys, tmp_path):
+    _no_network(monkeypatch)
+    path = tmp_path / "model.pkl"
+    path.write_bytes(b"fake")
+
+    braven.log_artifact(path)
+
+    assert "would log_artifact('model.pkl')" in capsys.readouterr().out
+
+
+def test_log_artifact_with_no_context_still_raises_on_missing_file(reset_pipeline_context, monkeypatch, tmp_path):
+    _no_network(monkeypatch)
+
+    with pytest.raises(FileNotFoundError):
+        braven.log_artifact(tmp_path / "missing.pkl")
+
+
+def test_upload_path_with_no_context_prints_instead_of_raising(reset_pipeline_context, monkeypatch, capsys, tmp_path):
+    _no_network(monkeypatch)
+    path = tmp_path / "plot.png"
+    path.write_bytes(b"fake")
+
+    braven.upload(path)
+
+    assert "would upload('plot.png')" in capsys.readouterr().out
+
+
+def test_upload_figure_with_no_context_saves_png_locally(reset_pipeline_context, monkeypatch, capsys, tmp_path):
+    _no_network(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    fig, ax = plt.subplots()
+    ax.plot([1, 2, 3], [1, 4, 9])
+
+    braven.upload(fig, "value_over_index.png")
+    plt.close(fig)
+
+    saved = tmp_path / braven._LOCAL_OUTPUT_DIR / "value_over_index.png"
+    assert saved.exists()
+    with Image.open(saved) as im:
+        im.verify()  # raises if the bytes aren't a real, decodable image
+    assert "saved figure to" in capsys.readouterr().out
+
+
+def test_upload_figure_with_no_context_does_not_overwrite_on_second_call(reset_pipeline_context, monkeypatch, tmp_path):
+    _no_network(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    fig1, ax1 = plt.subplots()
+    ax1.plot([1, 2], [1, 2])
+    fig2, ax2 = plt.subplots()
+    ax2.plot([3, 4], [3, 4])
+
+    braven.upload(fig1, "figure.png")
+    braven.upload(fig2, "figure.png")
+    plt.close(fig1)
+    plt.close(fig2)
+
+    out_dir = tmp_path / braven._LOCAL_OUTPUT_DIR
+    assert (out_dir / "figure.png").exists()
+    assert (out_dir / "figure_1.png").exists()  # second call didn't overwrite the first
+
+
+def test_partial_context_still_raises_not_local_mode(reset_pipeline_context, monkeypatch):
+    # Only experiment_id resolves, api_url doesn't — a real misconfiguration,
+    # not a local script; must still raise loudly, not silently fall back.
+    monkeypatch.setattr(braven, "braven_experiment_id", "exp_123")
+
+    with pytest.raises(RuntimeError, match="api_url not set"):
+        braven.log_config("k", "v")
+
+
+def test_configured_context_is_unaffected_by_local_mode_change(reset_pipeline_context, monkeypatch):
+    # Regression guard: a fully-configured context still queues for a real
+    # flush rather than local-mode printing.
+    monkeypatch.setattr(braven, "braven_experiment_id", "exp_123")
+    monkeypatch.setattr(braven, "braven_api_url", "https://api.example.com")
+
+    braven.log_config("lr", "0.001")
+
+    assert braven._metadata_queue == [
+        {"key": "lr", "value": "0.001", "category": "config", "device_key": None, "device_type": None}
+    ]
