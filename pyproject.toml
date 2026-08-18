@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "braven"
-version = "0.1.2"
+version = "0.2.0"
 description = "Python SDK for the Braven experiment tracker"
 readme = "README.md"
 license = "MIT"
@@ -13,8 +13,8 @@ authors = [{ name = "Braven" }]
 dependencies = ["requests>=2.28"]
 
 [project.urls]
-Homepage = "https://github.com/bravenlab/braven-python"
-Issues = "https://github.com/bravenlab/braven-python/issues"
+Homepage = "https://github.com/braven-lab/braven-python"
+Issues = "https://github.com/braven-lab/braven-python/issues"
 Documentation = "https://docs.bravenlab.com"
 
 [project.optional-dependencies]

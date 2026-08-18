@@ -72,23 +72,48 @@ Prefer to log a plain array without a matplotlib figure at all?
 braven.plot_series("snr_vs_temp", y=snr_values, x=temperatures, x_label="Temp (C)", y_label="SNR (dB)")
 ```
 
-## Devices — multiple sensors/units in one experiment
+## Devices — multiple sensors/units in one pipeline run
 
 Tag a value with a stable per-device key and the KPI name stays the same
 across devices (no `SNR_dev1`, `SNR_dev2`) — the device becomes a separate
-coordinate instead of a suffix:
+coordinate instead of a suffix. In a **pipeline script**, each device also
+gets its own single-device Experiment under the run's Experiment (the
+"parent") — `get_device()` returns a handle scoped to it:
 
 ```python
 for sensor_id, snr in results.items():
-    braven.device(sensor_id).log_summary("SNR", snr)
+    braven.get_device(sensor_id).log_summary("SNR", snr)
 
-braven.log_summary("max_device_mismatch", spread)  # experiment-level, all devices
+braven.log_summary("max_device_mismatch", spread)  # parent-level, across all devices
+```
+
+Logging several values for the same device without threading a handle
+through every call? `set_device()` sets an ambient current device for
+subsequent bare calls, the device-scoped equivalent of how `braven.init()`
+sets the ambient current run:
+
+```python
+braven.set_device("SENSOR-4471")
+braven.log_config("gain_db", 12)
+braven.log_summary("SNR", 14.2)
+braven.upload(fig, name="spectrum.png")   # this device's own figure
+braven.set_device(None)                   # back to parent-level logging
 ```
 
 A device is auto-created on first sight and its history accumulates across
 experiments — pass an optional type on first use
-(`braven.device("SENSOR-4471", "Photodiode")`) to name what kind of device
-it is; it's ignored once the device already exists.
+(`braven.get_device("SENSOR-4471", "Photodiode")`) to name what kind of
+device it is; it's ignored once the device already exists.
+
+A **direct-logging** Run's device handle (`run.get_device(key)`, not the
+module-level `get_device()`) has no parent/child concept — it still tags
+device-scoped values onto rows of that same Experiment; `Device.upload()`
+is pipeline-only.
+
+> `braven.device()` was renamed to `get_device()`/`set_device()` in 0.2.0 —
+> calling the old name now raises with migration guidance rather than
+> silently keeping the old shared-row behavior, since it changed what a
+> device-tagged value actually means (its own Experiment, not a tagged row).
 
 ## Pipeline scripts (run by the Braven worker)
 
@@ -107,7 +132,7 @@ def process(braven=None):
     braven.log_artifact("plot.png")
 
     # Devices and matplotlib figures work exactly as in direct logging:
-    braven.device("SENSOR-1").log_summary("SNR", 14.2)
+    braven.get_device("SENSOR-1").log_summary("SNR", 14.2)
     braven.upload(fig, name="spectrum.png")
 ```
 

@@ -364,6 +364,8 @@ def reset_pipeline_context(monkeypatch):
         monkeypatch.setattr(braven, "column_maps", {})
         monkeypatch.setattr(braven, "_pipeline_run", None)
         monkeypatch.setattr(braven, "_current_run", None)
+        monkeypatch.setattr(braven, "_current_device_key", None)
+        monkeypatch.setattr(braven, "_current_device_type", None)
 
     _clear()
     yield
@@ -406,12 +408,72 @@ def test_log_series_with_no_context_prints_instead_of_raising(reset_pipeline_con
     assert "would log_series" in capsys.readouterr().out
 
 
-def test_device_logging_with_no_context_prints_and_tags_device(reset_pipeline_context, monkeypatch, capsys):
+def test_get_device_logging_with_no_context_prints_and_tags_device(reset_pipeline_context, monkeypatch, capsys):
     _no_network(monkeypatch)
 
-    braven.device("SENSOR-1").log_summary("SNR", 14.2)
+    braven.get_device("SENSOR-1").log_summary("SNR", 14.2)
 
     assert "would log_summary('SNR', '14.2', device='SENSOR-1')" in capsys.readouterr().out
+
+
+def test_device_is_removed_and_raises_with_migration_guidance(reset_pipeline_context):
+    with pytest.raises(RuntimeError, match="get_device"):
+        braven.device("SENSOR-1")
+
+
+def test_set_device_makes_subsequent_bare_calls_ambient(reset_pipeline_context, monkeypatch, capsys):
+    _no_network(monkeypatch)
+
+    braven.set_device("SENSOR-1")
+    braven.log_config("gain", "10")
+    braven.log_summary("SNR", 14.2)
+    braven.log_series("temperature", [1.0, 2.0])
+
+    out = capsys.readouterr().out
+    assert "would log_config('gain', '10', device='SENSOR-1')" in out
+    # log_summary doesn't str()-cast its value (unlike _PipelineRun.log_summary) —
+    # a float prints unquoted via repr, unlike log_config's string above.
+    assert "would log_summary('SNR', 14.2, device='SENSOR-1')" in out
+    assert "device='SENSOR-1'" in out  # log_series line
+
+
+def test_set_device_none_returns_to_parent_level(reset_pipeline_context, monkeypatch, capsys):
+    _no_network(monkeypatch)
+
+    braven.set_device("SENSOR-1")
+    braven.set_device(None)
+    braven.log_summary("max_device_mismatch", 3.1)
+
+    out = capsys.readouterr().out
+    assert "would log_summary('max_device_mismatch', 3.1)" in out
+    assert "device=" not in out
+
+
+def test_set_device_is_reset_by_init_pipeline(reset_pipeline_context, monkeypatch):
+    braven.set_device("SENSOR-1")
+    braven.init_pipeline(experiment_id="exp_1", api_url="https://api.example")
+    assert braven._current_device_key is None
+    assert braven._current_device_type is None
+
+
+def test_device_upload_from_pipeline_handle_is_pipeline_only(reset_pipeline_context, monkeypatch, capsys, tmp_path):
+    _no_network(monkeypatch)
+    path = tmp_path / "figure.png"
+    path.write_bytes(b"fake")
+
+    braven.get_device("SENSOR-1").upload(path)
+
+    assert "would upload('figure.png', device='SENSOR-1')" in capsys.readouterr().out
+
+
+def test_device_upload_from_a_direct_run_handle_raises(reset_pipeline_context, monkeypatch):
+    class _FakeRun:
+        def _log(self, *a, **k):
+            pass
+
+    dev = braven.Device("SENSOR-1", run=_FakeRun())
+    with pytest.raises(RuntimeError, match="pipeline scripts"):
+        dev.upload("whatever.png")
 
 
 def test_flush_metadata_with_no_context_is_a_noop_print(reset_pipeline_context, monkeypatch, capsys):
