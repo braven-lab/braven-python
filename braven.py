@@ -1348,8 +1348,8 @@ def _pipeline_upload(path_or_fig, name: str | None = None, device_key: str | Non
             for g in groups:
                 for trace_idx, tr in enumerate(g["traces"]):
                     prefix = f"mplplot::{base}::{g['axes_index']}::{trace_idx}"
-                    _pipeline_log(f"{prefix}::y", json.dumps(tr["y"]), "series")
-                    _pipeline_log(f"{prefix}::x", json.dumps(tr["x"]), "series")
+                    _pipeline_log(f"{prefix}::y", json.dumps(tr["y"]), "series", device_key=device_key, device_type=device_type)
+                    _pipeline_log(f"{prefix}::x", json.dumps(tr["x"]), "series", device_key=device_key, device_type=device_type)
                     meta = {
                         "mode": tr["mode"],
                         "trace_label": tr["label"],
@@ -1358,7 +1358,7 @@ def _pipeline_upload(path_or_fig, name: str | None = None, device_key: str | Non
                         "x_scale": g["x_scale"],
                         "y_scale": g["y_scale"],
                     }
-                    _pipeline_log(f"{prefix}::meta", json.dumps(meta), "series")
+                    _pipeline_log(f"{prefix}::meta", json.dumps(meta), "series", device_key=device_key, device_type=device_type)
         except Exception as e:
             print(f"[braven] matplotlib series extraction skipped: {e}")
 
