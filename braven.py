@@ -933,6 +933,16 @@ braven_watcher_secret: str | None = None
 braven_user_id: str | None = None
 braven_pipeline_id: str | None = None
 
+# Streaming mode (2026-08-22, default ON): when true, log_config()/
+# log_summary() (Experiment-level, non-series) each send their own entry to
+# the backend immediately instead of only joining the buffered queue below —
+# see _pipeline_log() and _stream_one_entry(). log_series()/plot_series() and
+# any get_device(...)-scoped call are deliberately excluded regardless of this
+# flag — they stay exclusively on the buffered flush_metadata() path (see
+# _stream_one_entry's docstring for why). Toggle with
+# braven.init_pipeline(stream=False) / braven.init(stream=False).
+braven_stream: bool = True
+
 _metadata_queue: list[dict] = []
 
 # ADR-0013: the ambient current device set by set_device() — consulted by
@@ -1053,15 +1063,26 @@ def init_pipeline(
     watcher_secret: str | None = None,
     user_id: str | None = None,
     pipeline_id: str | None = None,
+    stream: bool | None = None,
 ) -> "_PipelineRun":
     """Initialise the pipeline execution context (called by the worker executor).
 
     Prefer ``braven.init()`` for direct logging from your own scripts. Returns a
     run handle bound to the pipeline's experiment.
+
+    ``stream`` (default: unchanged, i.e. stays at the module default of True)
+    controls whether log_config()/log_summary() write immediately or only join
+    the buffered end-of-run flush — see the ``braven_stream`` module doc above.
+    Pass ``None`` (the default) to leave whatever's already set untouched, same
+    as every other field here — only an explicit True/False changes it, so
+    _ensure_pipeline_init()'s internal no-args re-entry can never silently
+    reset a script's own stream=False choice back to the default.
     """
     global braven_experiment_id, braven_api_url, braven_watcher_secret
-    global braven_user_id, braven_pipeline_id, _metadata_queue, column_maps, params, _pipeline_run
+    global braven_user_id, braven_pipeline_id, braven_stream, _metadata_queue, column_maps, params, _pipeline_run
     global _current_device_key, _current_device_type
+    if stream is not None:
+        braven_stream = stream
     braven_experiment_id = experiment_id or braven_experiment_id or os.environ.get("BRAVEN_EXPERIMENT_ID")
     braven_api_url = api_url or braven_api_url or os.environ.get("BRAVEN_API_URL")
     braven_watcher_secret = (
@@ -1207,7 +1228,7 @@ def _pipeline_plot_series(
 
 
 def _pipeline_log(key: str, value: str, category: str, device_key: str | None = None, device_type: str | None = None) -> None:
-    experiment_id, _api_url = _ensure_pipeline_init()
+    experiment_id, api_url = _ensure_pipeline_init()
     if not experiment_id:  # local dry mode — see the section above
         fn = _CATEGORY_TO_LOG_FN.get(category, "log_config")
         suffix = f", device={device_key!r}" if device_key else ""
@@ -1218,6 +1239,45 @@ def _pipeline_log(key: str, value: str, category: str, device_key: str | None = 
     # earlier value for that key, never another device's (Spec 04 long format).
     _metadata_queue = [e for e in _metadata_queue if not (e["key"] == key and e.get("device_key") == device_key)]
     _metadata_queue.append({"key": key, "value": str(value), "category": category, "device_key": device_key, "device_type": device_type})
+    # Streaming mode (default on): also write this one entry immediately —
+    # scoped to Experiment-level, non-series entries only. See
+    # _stream_one_entry's docstring for why device-tagged/series entries are
+    # excluded regardless of braven_stream, and why this is safe/cheap to do
+    # per call (unlike calling flush_metadata() itself here would be).
+    if braven_stream and device_key is None and category != "series":
+        _stream_one_entry(experiment_id, api_url, key, str(value), category)
+
+
+def _stream_one_entry(experiment_id: str, api_url: str, key: str, value: str, category: str) -> None:
+    """Best-effort immediate write for one Experiment-level, non-series entry
+    (streaming mode). Hits a separate, narrower endpoint than flush_metadata()
+    — PATCH .../pipeline-metadata/{id}, an incremental upsert scoped to just
+    this key — rather than that endpoint's PUT, which re-derives and rewrites
+    the WHOLE accumulated flush every call (O(total entries so far) per call,
+    O(n²) over a run — fine once at the end, not once per log statement).
+    Device-tagged and series entries are excluded from streaming and stay
+    exclusively on the buffered flush_metadata() path: device entries need
+    real per-flush resolution work (company/child-Experiment routing) worth
+    doing once, and Series lives in R2 (ADR-0001) as a read-modify-write
+    object, not a row — streaming those would mean a full object write per
+    log_series()/plot_series() call.
+
+    Never raises: a transient failure here just means this value shows up
+    once the run finishes instead of live — flush_metadata() at run end is
+    still the source of truth and rewrites it correctly regardless.
+    """
+    if not braven_pipeline_id:
+        return
+    try:
+        resp = requests.patch(
+            f"{api_url.rstrip('/')}/experiments/{experiment_id}/pipeline-metadata/{braven_pipeline_id}",
+            json=[{"key": key, "value": value, "category": category}],
+            headers=_pipeline_auth_headers(),
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[braven] streaming flush skipped for {key!r}: {e}", flush=True)
 
 
 def _describe_device_report(report: dict) -> str:
@@ -1411,7 +1471,7 @@ def init(*args, **kwargs):  # type: ignore[misc]
     call init() are unaffected. (Creating additional experiments from one pipeline
     is not supported yet; a repeat init() returns the same adopted run.)
     """
-    pipeline_keys = {"experiment_id", "api_url", "watcher_secret", "user_id", "pipeline_id"}
+    pipeline_keys = {"experiment_id", "api_url", "watcher_secret", "user_id", "pipeline_id", "stream"}
     if args or (kwargs and pipeline_keys.intersection(kwargs)):
         return init_pipeline(*args, **kwargs)
     # Bare init() while a pipeline context is active → adopt the pre-created run.

@@ -366,6 +366,7 @@ def reset_pipeline_context(monkeypatch):
         monkeypatch.setattr(braven, "_current_run", None)
         monkeypatch.setattr(braven, "_current_device_key", None)
         monkeypatch.setattr(braven, "_current_device_type", None)
+        monkeypatch.setattr(braven, "braven_stream", True)
 
     _clear()
     yield
@@ -380,6 +381,7 @@ def _no_network(monkeypatch):
     monkeypatch.setattr(braven.requests, "post", _boom)
     monkeypatch.setattr(braven.requests, "put", _boom)
     monkeypatch.setattr(braven.requests, "get", _boom)
+    monkeypatch.setattr(braven.requests, "patch", _boom)
 
 
 def test_log_config_with_no_context_prints_instead_of_raising(reset_pipeline_context, monkeypatch, capsys):
@@ -560,6 +562,106 @@ def test_configured_context_is_unaffected_by_local_mode_change(reset_pipeline_co
     # flush rather than local-mode printing.
     monkeypatch.setattr(braven, "braven_experiment_id", "exp_123")
     monkeypatch.setattr(braven, "braven_api_url", "https://api.example.com")
+
+    braven.log_config("lr", "0.001")
+
+    assert braven._metadata_queue == [
+        {"key": "lr", "value": "0.001", "category": "config", "device_key": None, "device_type": None}
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Streaming mode (2026-08-22) — log_config()/log_summary() write immediately,
+# by default, alongside the buffered queue a real flush_metadata() still
+# needs at run end. requests.patch is monkeypatched (not hit for real) —
+# same "no real network" boundary the rest of this file keeps, just with a
+# recording fake instead of _no_network's failing one, since asserting the
+# call did/didn't happen IS the behavior under test here.
+# ---------------------------------------------------------------------------
+
+def _configure_pipeline_context(monkeypatch, *, pipeline_id="pipe_1"):
+    monkeypatch.setattr(braven, "braven_experiment_id", "exp_123")
+    monkeypatch.setattr(braven, "braven_api_url", "https://api.example.com")
+    monkeypatch.setattr(braven, "braven_pipeline_id", pipeline_id)
+
+
+def test_streaming_default_on_patches_experiment_level_entries_immediately(reset_pipeline_context, monkeypatch):
+    _configure_pipeline_context(monkeypatch)
+    calls = []
+
+    def _fake_patch(url, json=None, headers=None, timeout=None):
+        calls.append((url, json))
+        return type("Resp", (), {"raise_for_status": lambda self: None})()
+
+    monkeypatch.setattr(braven.requests, "patch", _fake_patch)
+
+    braven.log_config("lr", "0.001")
+
+    assert calls == [
+        ("https://api.example.com/experiments/exp_123/pipeline-metadata/pipe_1",
+         [{"key": "lr", "value": "0.001", "category": "config"}])
+    ]
+    # Still queued too — flush_metadata() at run end stays the source of truth.
+    assert braven._metadata_queue == [
+        {"key": "lr", "value": "0.001", "category": "config", "device_key": None, "device_type": None}
+    ]
+
+
+def test_streaming_disabled_never_hits_the_network(reset_pipeline_context, monkeypatch):
+    _configure_pipeline_context(monkeypatch)
+    braven.init_pipeline(stream=False)
+    _no_network(monkeypatch)
+
+    braven.log_config("lr", "0.001")  # must not raise
+
+    assert braven._metadata_queue == [
+        {"key": "lr", "value": "0.001", "category": "config", "device_key": None, "device_type": None}
+    ]
+
+
+def test_streaming_skips_device_tagged_entries(reset_pipeline_context, monkeypatch):
+    _configure_pipeline_context(monkeypatch)
+    _no_network(monkeypatch)  # a device-scoped call must not hit the streaming endpoint
+
+    braven.get_device("SENSOR-1").log_summary("SNR", 14.2)
+
+    assert braven._metadata_queue == [
+        {"key": "SNR", "value": "14.2", "category": "summary", "device_key": "SENSOR-1", "device_type": None}
+    ]
+
+
+def test_streaming_skips_series_entries(reset_pipeline_context, monkeypatch):
+    _configure_pipeline_context(monkeypatch)
+    _no_network(monkeypatch)  # series stays on the buffered path — no per-call R2 write
+
+    braven.log_series("trace", [1, 2, 3])
+
+    assert len(braven._metadata_queue) == 1
+    assert braven._metadata_queue[0]["category"] == "series"
+
+
+def test_streaming_failure_is_swallowed_not_raised(reset_pipeline_context, monkeypatch, capsys):
+    _configure_pipeline_context(monkeypatch)
+
+    def _boom(*args, **kwargs):
+        raise ConnectionError("network is down")
+
+    monkeypatch.setattr(braven.requests, "patch", _boom)
+
+    braven.log_config("lr", "0.001")  # must not raise despite the streaming call failing
+
+    assert "streaming flush skipped" in capsys.readouterr().out
+    assert braven._metadata_queue == [
+        {"key": "lr", "value": "0.001", "category": "config", "device_key": None, "device_type": None}
+    ]
+
+
+def test_streaming_without_pipeline_id_is_a_noop_not_an_error(reset_pipeline_context, monkeypatch):
+    # braven_pipeline_id unset (e.g. a caller that never passed it) — streaming
+    # has nothing to PATCH against, so it must skip silently, not hit the network.
+    monkeypatch.setattr(braven, "braven_experiment_id", "exp_123")
+    monkeypatch.setattr(braven, "braven_api_url", "https://api.example.com")
+    _no_network(monkeypatch)
 
     braven.log_config("lr", "0.001")
 
