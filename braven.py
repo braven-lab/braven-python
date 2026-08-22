@@ -61,6 +61,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Union
@@ -986,6 +987,21 @@ braven_stream: bool = True
 
 _metadata_queue: list[dict] = []
 
+# Device-scoped streaming (2026-08-22 follow-up — see _pipeline_log below).
+# Unlike Experiment-level entries (streamed one-by-one, _stream_one_entry),
+# a device-scoped log_config()/log_summary()/plot_series() call is buffered
+# here and flushed as a BATCH on a debounced cadence instead: a wafer-scale
+# run calls these hundreds-thousands of times (several per die), and even a
+# fast per-call round trip doesn't scale to that volume — the constraint is
+# call COUNT, not latency. DEVICE_STREAM_INTERVAL_S bounds how often a batch
+# goes out regardless of how fast dies are processed; the buffer keeps
+# accumulating between flushes so nothing is lost, and the final
+# flush_metadata() at run end remains the source of truth regardless (this
+# is a live-preview path, not the write of record).
+DEVICE_STREAM_INTERVAL_S = 2.0
+_device_stream_queue: list[dict] = []
+_device_stream_last_flush_at: float = 0.0
+
 # ADR-0013: the ambient current device set by set_device() — consulted by
 # log_config()/log_summary()/log_series()/plot_series()/upload() below so a
 # pipeline script can write several values for one device without threading
@@ -1122,6 +1138,7 @@ def init_pipeline(
     global braven_experiment_id, braven_api_url, braven_watcher_secret
     global braven_user_id, braven_pipeline_id, braven_stream, _metadata_queue, column_maps, params, _pipeline_run
     global _current_device_key, _current_device_type
+    global _device_stream_queue, _device_stream_last_flush_at
     if stream is not None:
         braven_stream = stream
     braven_experiment_id = experiment_id or braven_experiment_id or os.environ.get("BRAVEN_EXPERIMENT_ID")
@@ -1148,6 +1165,8 @@ def init_pipeline(
     if experiment_id is not None:
         _current_device_key = None
         _current_device_type = None
+        _device_stream_queue = []
+        _device_stream_last_flush_at = 0.0
     _pipeline_run = _PipelineRun(braven_experiment_id)
     return _pipeline_run
 
@@ -1280,13 +1299,17 @@ def _pipeline_log(key: str, value: str, category: str, device_key: str | None = 
     # earlier value for that key, never another device's (Spec 04 long format).
     _metadata_queue = [e for e in _metadata_queue if not (e["key"] == key and e.get("device_key") == device_key)]
     _metadata_queue.append({"key": key, "value": str(value), "category": category, "device_key": device_key, "device_type": device_type})
-    # Streaming mode (default on): also write this one entry immediately —
-    # scoped to Experiment-level, non-series entries only. See
-    # _stream_one_entry's docstring for why device-tagged/series entries are
-    # excluded regardless of braven_stream, and why this is safe/cheap to do
-    # per call (unlike calling flush_metadata() itself here would be).
-    if braven_stream and device_key is None and category != "series":
+    if not braven_stream or category == "series":
+        return
+    # Experiment-level: stream this one entry immediately — see
+    # _stream_one_entry's docstring for why this is safe/cheap per call.
+    if device_key is None:
         _stream_one_entry(experiment_id, api_url, key, str(value), category)
+        return
+    # Device-scoped: buffer + debounce — see _flush_device_stream_queue's
+    # docstring for why this can't be a per-call immediate write the way the
+    # Experiment-level case above is.
+    _queue_device_stream_entry(experiment_id, api_url, key, str(value), category, device_key, device_type)
 
 
 def _stream_one_entry(experiment_id: str, api_url: str, key: str, value: str, category: str) -> None:
@@ -1296,12 +1319,12 @@ def _stream_one_entry(experiment_id: str, api_url: str, key: str, value: str, ca
     this key — rather than that endpoint's PUT, which re-derives and rewrites
     the WHOLE accumulated flush every call (O(total entries so far) per call,
     O(n²) over a run — fine once at the end, not once per log statement).
-    Device-tagged and series entries are excluded from streaming and stay
-    exclusively on the buffered flush_metadata() path: device entries need
-    real per-flush resolution work (company/child-Experiment routing) worth
-    doing once, and Series lives in R2 (ADR-0001) as a read-modify-write
-    object, not a row — streaming those would mean a full object write per
-    log_series()/plot_series() call.
+    Series entries are excluded from streaming and stay exclusively on the
+    buffered flush_metadata() path: Series lives in R2 (ADR-0001) as a
+    read-modify-write object, not a row — streaming those would mean a full
+    object write per log_series()/plot_series() call. Device-tagged entries
+    go through the SAME endpoint, but debounced+batched — see
+    _flush_device_stream_queue below, not this function.
 
     Never raises: a transient failure here just means this value shows up
     once the run finishes instead of live — flush_metadata() at run end is
@@ -1319,6 +1342,55 @@ def _stream_one_entry(experiment_id: str, api_url: str, key: str, value: str, ca
         resp.raise_for_status()
     except Exception as e:
         print(f"[braven] streaming flush skipped for {key!r}: {e}", flush=True)
+
+
+def _queue_device_stream_entry(
+    experiment_id: str, api_url: str, key: str, value: str, category: str, device_key: str, device_type: str | None
+) -> None:
+    """Buffer one device-scoped entry for the debounced flush and send the
+    batch once DEVICE_STREAM_INTERVAL_S has elapsed since the last one — see
+    that constant's module-level comment for why this is batched+debounced
+    rather than a per-call immediate write the way _stream_one_entry is for
+    Experiment-level entries. Bounds call volume, not latency: a wafer run
+    calling log_config()/log_summary() per die would otherwise mean
+    hundreds-thousands of streaming round trips regardless of how fast any
+    one of them is."""
+    global _device_stream_queue, _device_stream_last_flush_at
+    _device_stream_queue = [
+        e for e in _device_stream_queue if not (e["key"] == key and e.get("device_key") == device_key)
+    ]
+    _device_stream_queue.append(
+        {"key": key, "value": value, "category": category, "device_key": device_key, "device_type": device_type}
+    )
+    now = time.time()
+    if now - _device_stream_last_flush_at >= DEVICE_STREAM_INTERVAL_S:
+        _flush_device_stream_queue(experiment_id, api_url)
+        _device_stream_last_flush_at = now
+
+
+def _flush_device_stream_queue(experiment_id: str, api_url: str) -> None:
+    """Best-effort immediate write of every currently-buffered device-scoped
+    entry, in one PATCH — the batch may span several devices (whatever
+    accumulated since the last flush), each resolved to its own child
+    Experiment server-side (appendPipelineMetadataEntries, backend-ts).
+    Clears the buffer on success; a transient failure leaves entries queued
+    for the next debounce tick (or the final flush_metadata(), the source of
+    truth regardless) rather than dropping them. Never raises."""
+    global _device_stream_queue
+    if not _device_stream_queue or not braven_pipeline_id:
+        return
+    batch = _device_stream_queue
+    try:
+        resp = requests.patch(
+            f"{api_url.rstrip('/')}/experiments/{experiment_id}/pipeline-metadata/{braven_pipeline_id}",
+            json=batch,
+            headers=_pipeline_auth_headers(),
+            timeout=15,
+        )
+        resp.raise_for_status()
+        _device_stream_queue = []
+    except Exception as e:
+        print(f"[braven] device-scoped streaming flush skipped ({len(batch)} entries): {e}", flush=True)
 
 
 def _describe_device_report(report: dict) -> str:
