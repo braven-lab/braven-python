@@ -501,13 +501,20 @@ class Run:
         the same `name` and a distinct `y_label` to group traces onto one chart."""
         self._log_many(_build_plot_series_entries(name, y, x, x_label, y_label, mode))
 
-    def upload(self, path_or_fig, name: str | None = None) -> None:
+    def upload(self, path_or_fig, name: str | None = None, interactive: bool = True) -> None:
         """Upload a file and attach it to this experiment.
 
         `path_or_fig` may be a file path, or a live matplotlib Figure — in the latter
-        case the PNG is saved the same way `fig.savefig()` would, and the SDK also
-        attempts to extract an interactive companion series from the figure's
-        line/scatter data (best-effort, never blocks the upload).
+        case the PNG is saved the same way `fig.savefig()` would, and (when
+        `interactive` is True, the default) the SDK also attempts to extract an
+        interactive companion series from the figure's line/scatter data
+        (best-effort, never blocks the upload).
+
+        Pass `interactive=False` to skip that extraction — it costs an extra
+        metadata flush to the backend (ADR-0002's deferred opt-out; see the
+        ADR for why per-line identity was rejected). Worth setting for a figure
+        re-uploaded rapidly in a loop (e.g. a live-updating plot), where only
+        the final frame's interactive data is likely to matter.
         """
         fig = path_or_fig if _is_matplotlib_figure(path_or_fig) else None
         tmp_path: Path | None = None
@@ -538,7 +545,7 @@ class Run:
             except Exception:
                 pass
 
-        if fig is not None:
+        if fig is not None and interactive:
             self._log_matplotlib_series(fig, upload_name)
 
     def finish(self) -> None:
@@ -667,20 +674,23 @@ class Device:
             for k, v, c in entries:
                 _pipeline_log(k, v, c, device_key=self.key, device_type=self.type)
 
-    def upload(self, path_or_fig, name: str | None = None) -> None:
+    def upload(self, path_or_fig, name: str | None = None, interactive: bool = True) -> None:
         """Upload a file (or a live matplotlib Figure — see Run.upload) attached
         to this device's own child Experiment (ADR-0013). Pipeline scripts only
         (via braven.get_device()) — a direct-logging Run's device handle
         (run.get_device()) still uses Spec 04's device-tagged-row model for
         every other method on this class, so a device-scoped upload spinning
         up a child Experiment nothing else about that Run knows about would be
-        a silent, confusing split; this raises instead."""
+        a silent, confusing split; this raises instead.
+
+        `interactive=False` skips the companion-series extraction for a
+        matplotlib Figure — see Run.upload()."""
         if self._run is not None:
             raise RuntimeError(
                 "Device.upload() is only supported for pipeline scripts (braven.get_device()), "
                 "not a direct-logging Run's device handle (run.get_device())."
             )
-        _pipeline_upload(path_or_fig, name, device_key=self.key, device_type=self.type)
+        _pipeline_upload(path_or_fig, name, device_key=self.key, device_type=self.type, interactive=interactive)
 
     def _log(self, key: str, value, category: str) -> None:
         if self._run is not None:
@@ -817,16 +827,19 @@ def summary(key: str, value) -> None:
     _current_run.summary(key, value)
 
 
-def upload(path_or_fig, name: str | None = None) -> None:
+def upload(path_or_fig, name: str | None = None, interactive: bool = True) -> None:
     """Upload a file (or a live matplotlib Figure — see Run.upload) attached to the
     current experiment. Works from either a direct-log run (after braven.init()) or a
     pipeline script — same dual dispatch as plot_series(). In a pipeline script, goes
     to the ambient current device's own child Experiment (see set_device()) if one is
-    set, else the parent."""
+    set, else the parent.
+
+    `interactive=False` skips the companion-series extraction for a matplotlib
+    Figure — see Run.upload()."""
     if _current_run is not None:
-        _current_run.upload(path_or_fig, name)
+        _current_run.upload(path_or_fig, name, interactive=interactive)
     else:
-        _pipeline_upload(path_or_fig, name, device_key=_current_device_key, device_type=_current_device_type)
+        _pipeline_upload(path_or_fig, name, device_key=_current_device_key, device_type=_current_device_type, interactive=interactive)
 
 
 def plot_series(
@@ -1050,8 +1063,8 @@ class _PipelineRun:
     def plot_series(self, name: str, y: list, x: list | None = None, x_label: str | None = None, y_label: str | None = None, mode: str = "line") -> None:
         _pipeline_plot_series(name, y, x=x, x_label=x_label, y_label=y_label, mode=mode)
 
-    def upload(self, path_or_fig, name: str | None = None) -> None:
-        _pipeline_upload(path_or_fig, name, device_key=_current_device_key, device_type=_current_device_type)
+    def upload(self, path_or_fig, name: str | None = None, interactive: bool = True) -> None:
+        _pipeline_upload(path_or_fig, name, device_key=_current_device_key, device_type=_current_device_type, interactive=interactive)
 
     def __repr__(self) -> str:
         return f"Run(pipeline, id={self.id!r})"
@@ -1342,16 +1355,17 @@ def log_plot(fig, name: str) -> None:
     )
 
 
-def _pipeline_upload(path_or_fig, name: str | None = None, device_key: str | None = None, device_type: str | None = None) -> None:
+def _pipeline_upload(path_or_fig, name: str | None = None, device_key: str | None = None, device_type: str | None = None, interactive: bool = True) -> None:
     """Pipeline-mode twin of Run.upload(): upload a file (or a live
     matplotlib Figure) attached to the current pipeline experiment — or, with
     `device_key` set (Device.upload()/the ambient current device, ADR-0013),
     to that device's own child Experiment; the backend resolves the child
     from `device_key` server-side, same as it does for metadata's device_key.
-    For a Figure, the PNG is saved the same way fig.savefig() would, and an
-    interactive companion series is extracted from the figure's line/scatter
-    data (best-effort — queued as series metadata and written by the final
-    flush_metadata(), never blocking the upload itself)."""
+    For a Figure, the PNG is saved the same way fig.savefig() would, and
+    (when `interactive` is True, the default) an interactive companion series
+    is extracted from the figure's line/scatter data (best-effort — queued as
+    series metadata and written by the final flush_metadata(), never blocking
+    the upload itself)."""
     fig = path_or_fig if _is_matplotlib_figure(path_or_fig) else None
     if fig is not None:
         upload_name = name or "figure.png"
@@ -1401,7 +1415,7 @@ def _pipeline_upload(path_or_fig, name: str | None = None, device_key: str | Non
         except Exception:
             pass
 
-    if fig is not None:
+    if fig is not None and interactive:
         try:
             groups = _walk_matplotlib_figure(fig)
             base = _safe_filename_sdk(upload_name)
@@ -1739,14 +1753,14 @@ class Analysis:
             raise FileNotFoundError(f"log_artifact: file not found: {file_path}")
         self._upload_file(file_path, name or file_path.name)
 
-    def upload(self, path_or_fig, name: str | None = None) -> None:
+    def upload(self, path_or_fig, name: str | None = None, interactive: bool = True) -> None:
         """Upload a file and attach it to this Analysis.
 
         `path_or_fig` may be a file path, or a live matplotlib Figure — in the
         latter case the PNG is saved the same way `fig.savefig()` would, and
-        an interactive companion series is extracted from the figure's
-        line/scatter data (best-effort, never blocks the upload) — the same
-        upload() pattern Runs already use.
+        (when `interactive` is True, the default) an interactive companion
+        series is extracted from the figure's line/scatter data (best-effort,
+        never blocks the upload) — the same upload() pattern Runs already use.
         """
         fig = path_or_fig if _is_matplotlib_figure(path_or_fig) else None
         tmp_path: Path | None = None
@@ -1769,7 +1783,7 @@ class Analysis:
             except Exception:
                 pass
 
-        if fig is not None:
+        if fig is not None and interactive:
             self._log_matplotlib_series(fig, upload_name)
 
     def _upload_file(self, file_path: Path, upload_name: str) -> None:
