@@ -459,13 +459,30 @@ class Run:
     # Logging
     # ------------------------------------------------------------------
 
-    def config(self, key: str, value) -> None:
-        """Log an input / configuration parameter (experiment-level)."""
-        self._log(key, value, "config")
+    def config(self, key: str, value, flush: bool = True) -> None:
+        """Log an input / configuration parameter (experiment-level).
 
-    def summary(self, key: str, value) -> None:
-        """Log an output metric (experiment-level)."""
-        self._log(key, value, "summary")
+        Each call PUTs the full metadata set immediately by default (~1.5s
+        measured in production — see ADR-0002's implementation note in
+        braven-mvp's docs/adr/, same underlying cost as upload()'s
+        interactive=False fix) — fine for one-off values, but logging several
+        config keys back-to-back at startup pays that cost once per key. Pass
+        `flush=False` to only update the in-memory value and defer the PUT;
+        the next flush=True call (or an explicit .flush()) sends everything
+        accumulated so far in one PUT instead of one per key.
+        """
+        self._log(key, value, "config", flush=flush)
+
+    def summary(self, key: str, value, flush: bool = True) -> None:
+        """Log an output metric (experiment-level). See config()'s docstring
+        for `flush` — the same one-PUT-per-key cost applies here."""
+        self._log(key, value, "summary", flush=flush)
+
+    def flush(self) -> None:
+        """Send any pending flush=False config()/summary() values now, in one
+        PUT. No-op if nothing is pending (also called automatically by
+        finish())."""
+        self._flush()
 
     def get_device(self, key: str, type: str | None = None) -> "Device":
         """Return a device-scoped handle within this experiment (Spec 04;
@@ -556,9 +573,10 @@ class Run:
     # Internals
     # ------------------------------------------------------------------
 
-    def _log(self, key: str, value, category: str, device_key: str | None = None, device_type: str | None = None) -> None:
+    def _log(self, key: str, value, category: str, device_key: str | None = None, device_type: str | None = None, flush: bool = True) -> None:
         self._metadata[(device_key, key)] = {"key": key, "value": str(value), "category": category, "device_key": device_key, "device_type": device_type}
-        self._flush()
+        if flush:
+            self._flush()
 
     def _log_many(self, entries: list[tuple[str, str, str]], device_key: str | None = None, device_type: str | None = None) -> None:
         """Like _log(), but for multiple (key, value, category) triples flushed once —
@@ -813,18 +831,28 @@ def _resolve_project_id(cfg: dict, company: str | None, project: str | None) -> 
     return found[0][1]
 
 
-def config(key: str, value) -> None:
-    """Log an input / configuration parameter on the active run."""
+def config(key: str, value, flush: bool = True) -> None:
+    """Log an input / configuration parameter on the active run. See
+    Run.config()'s docstring for `flush` — pass False when logging several
+    keys back-to-back to send them in one PUT instead of one per key."""
     if _current_run is None:
         raise RuntimeError("No active run. Call braven.init() first.")
-    _current_run.config(key, value)
+    _current_run.config(key, value, flush=flush)
 
 
-def summary(key: str, value) -> None:
-    """Log an output metric on the active run."""
+def summary(key: str, value, flush: bool = True) -> None:
+    """Log an output metric on the active run. See config()'s `flush`."""
     if _current_run is None:
         raise RuntimeError("No active run. Call braven.init() first.")
-    _current_run.summary(key, value)
+    _current_run.summary(key, value, flush=flush)
+
+
+def flush() -> None:
+    """Send any pending flush=False config()/summary() values on the active
+    run now, in one PUT. No-op if nothing is pending."""
+    if _current_run is None:
+        raise RuntimeError("No active run. Call braven.init() first.")
+    _current_run.flush()
 
 
 def upload(path_or_fig, name: str | None = None, interactive: bool = True) -> None:
