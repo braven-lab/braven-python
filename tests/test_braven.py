@@ -336,37 +336,25 @@ def test_load_config_raises_when_interactive_prompt_left_blank(isolated_config_p
 
 # ---------------------------------------------------------------------------
 # Local dry mode (docs/adr/0008-local-pipeline-dry-mode.md in braven-mvp) —
-# pipeline-vocabulary calls with no configured context print instead of
-# raising or touching the network. Every test resets the module-level
-# pipeline-context globals (they're process-wide state, not per-Run) and
-# asserts no HTTP call was ever attempted, since "doesn't raise" alone
-# wouldn't catch a version that silently degrades into a real network call
-# instead of a true no-op.
+# a bare `braven.init()` (adopted mode) with no configured experiment_id/
+# api_url prints instead of raising or touching the network. Every test
+# resets braven.py's module-level adopted-run singleton (process-wide state,
+# not per-Run) and asserts no HTTP call was ever attempted, since "doesn't
+# raise" alone wouldn't catch a version that silently degrades into a real
+# network call instead of a true no-op.
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
 def reset_pipeline_context(monkeypatch):
     """Isolates each test from real BRAVEN_* env vars and resets braven.py's
-    module-level pipeline/direct-run context before and after, so tests
-    can't leak state into each other via shared module globals."""
+    module-level adopted-run singleton before and after, so tests can't leak
+    state into each other via shared module state."""
     for var in ("BRAVEN_EXPERIMENT_ID", "BRAVEN_API_URL", "BRAVEN_WATCHER_SECRET", "WATCHER_SECRET", "BRAVEN_USER_ID"):
         monkeypatch.delenv(var, raising=False)
 
     def _clear():
-        monkeypatch.setattr(braven, "braven_experiment_id", None)
-        monkeypatch.setattr(braven, "braven_api_url", None)
-        monkeypatch.setattr(braven, "braven_watcher_secret", None)
-        monkeypatch.setattr(braven, "braven_user_id", None)
-        monkeypatch.setattr(braven, "braven_pipeline_id", None)
-        monkeypatch.setattr(braven, "_metadata_queue", [])
-        monkeypatch.setattr(braven, "params", {})
-        monkeypatch.setattr(braven, "column_maps", {})
-        monkeypatch.setattr(braven, "_pipeline_run", None)
-        monkeypatch.setattr(braven, "_current_run", None)
-        monkeypatch.setattr(braven, "_current_device_key", None)
-        monkeypatch.setattr(braven, "_current_device_type", None)
-        monkeypatch.setattr(braven, "braven_stream", True)
+        monkeypatch.setattr(braven, "_adopted_run", None)
 
     _clear()
     yield
@@ -384,132 +372,160 @@ def _no_network(monkeypatch):
     monkeypatch.setattr(braven.requests, "patch", _boom)
 
 
-def test_log_config_with_no_context_prints_instead_of_raising(reset_pipeline_context, monkeypatch, capsys):
+def test_config_with_no_context_prints_instead_of_raising(reset_pipeline_context, monkeypatch, capsys):
     _no_network(monkeypatch)
+    run = braven.init()
 
-    braven.log_config("lr", "0.001")  # must not raise
+    run.config("lr", "0.001")  # must not raise
+
+    assert "[braven:local] would config('lr', '0.001')" in capsys.readouterr().out
+
+
+def test_summary_with_no_context_prints_instead_of_raising(reset_pipeline_context, monkeypatch, capsys):
+    _no_network(monkeypatch)
+    run = braven.init()
+
+    run.summary("acc", "0.94")
+
+    assert "would summary('acc', '0.94')" in capsys.readouterr().out
+
+
+def test_series_with_no_context_prints_instead_of_raising(reset_pipeline_context, monkeypatch, capsys):
+    _no_network(monkeypatch)
+    run = braven.init()
+
+    run.series("temperature", [1.0, 2.0, 3.0])
+
+    assert "would series" in capsys.readouterr().out
+
+
+def test_set_device_logging_with_no_context_prints_and_tags_device(reset_pipeline_context, monkeypatch, capsys):
+    _no_network(monkeypatch)
+    run = braven.init()
+
+    run.set_device("SENSOR-1")
+    run.summary("SNR", 14.2)
+
+    assert "would summary('SNR', 14.2, device='SENSOR-1')" in capsys.readouterr().out
+
+
+def test_removed_ambient_names_raise_with_migration_guidance(reset_pipeline_context):
+    for name in ("device", "get_device", "log_config", "log_summary", "set_device", "upload"):
+        with pytest.raises(RuntimeError, match="run\\."):
+            getattr(braven, name)
+
+
+def test_set_device_makes_subsequent_calls_ambient(reset_pipeline_context, monkeypatch, capsys):
+    _no_network(monkeypatch)
+    run = braven.init()
+
+    run.set_device("SENSOR-1")
+    run.config("gain", "10")
+    run.summary("SNR", 14.2)
+    run.series("temperature", [1.0, 2.0])
 
     out = capsys.readouterr().out
-    assert "[braven:local] would log_config('lr', '0.001')" in out
-    assert braven._metadata_queue == []  # nothing queued in local mode
-
-
-def test_log_summary_with_no_context_prints_instead_of_raising(reset_pipeline_context, monkeypatch, capsys):
-    _no_network(monkeypatch)
-
-    braven.log_summary("acc", "0.94")
-
-    assert "would log_summary('acc', '0.94')" in capsys.readouterr().out
-
-
-def test_log_series_with_no_context_prints_instead_of_raising(reset_pipeline_context, monkeypatch, capsys):
-    _no_network(monkeypatch)
-
-    braven.log_series("temperature", [1.0, 2.0, 3.0])
-
-    assert "would log_series" in capsys.readouterr().out
-
-
-def test_get_device_logging_with_no_context_prints_and_tags_device(reset_pipeline_context, monkeypatch, capsys):
-    _no_network(monkeypatch)
-
-    braven.get_device("SENSOR-1").log_summary("SNR", 14.2)
-
-    assert "would log_summary('SNR', '14.2', device='SENSOR-1')" in capsys.readouterr().out
-
-
-def test_device_is_removed_and_raises_with_migration_guidance(reset_pipeline_context):
-    with pytest.raises(RuntimeError, match="get_device"):
-        braven.device("SENSOR-1")
-
-
-def test_set_device_makes_subsequent_bare_calls_ambient(reset_pipeline_context, monkeypatch, capsys):
-    _no_network(monkeypatch)
-
-    braven.set_device("SENSOR-1")
-    braven.log_config("gain", "10")
-    braven.log_summary("SNR", 14.2)
-    braven.log_series("temperature", [1.0, 2.0])
-
-    out = capsys.readouterr().out
-    assert "would log_config('gain', '10', device='SENSOR-1')" in out
-    # log_summary doesn't str()-cast its value (unlike _PipelineRun.log_summary) —
-    # a float prints unquoted via repr, unlike log_config's string above.
-    assert "would log_summary('SNR', 14.2, device='SENSOR-1')" in out
-    assert "device='SENSOR-1'" in out  # log_series line
+    assert "would config('gain', '10', device='SENSOR-1')" in out
+    assert "would summary('SNR', 14.2, device='SENSOR-1')" in out
+    assert "device='SENSOR-1'" in out  # series line
 
 
 def test_set_device_none_returns_to_parent_level(reset_pipeline_context, monkeypatch, capsys):
     _no_network(monkeypatch)
+    run = braven.init()
 
-    braven.set_device("SENSOR-1")
-    braven.set_device(None)
-    braven.log_summary("max_device_mismatch", 3.1)
+    run.set_device("SENSOR-1")
+    run.set_device(None)
+    run.summary("max_device_mismatch", 3.1)
 
     out = capsys.readouterr().out
-    assert "would log_summary('max_device_mismatch', 3.1)" in out
+    assert "would summary('max_device_mismatch', 3.1)" in out
     assert "device=" not in out
 
 
-def test_set_device_is_reset_by_init_pipeline(reset_pipeline_context, monkeypatch):
-    braven.set_device("SENSOR-1")
-    braven.init_pipeline(experiment_id="exp_1", api_url="https://api.example")
-    assert braven._current_device_key is None
-    assert braven._current_device_type is None
+def test_a_new_pipeline_run_starts_with_no_device_target(reset_pipeline_context, monkeypatch):
+    # A genuinely new run (experiment_id passed explicitly, as the worker's
+    # own once-per-run call does) is a fresh Run — set_device() state from a
+    # previous run can never leak into it.
+    run1 = braven.init(experiment_id="exp_1", api_url="https://api.example")
+    run1.set_device("SENSOR-1")
+
+    run2 = braven.init(experiment_id="exp_2", api_url="https://api.example")
+
+    assert run2 is not run1
+    assert run2._device_target is None
 
 
-def test_device_upload_from_pipeline_handle_is_pipeline_only(reset_pipeline_context, monkeypatch, capsys, tmp_path):
+def test_device_upload_with_no_context_prints_and_tags_device(reset_pipeline_context, monkeypatch, capsys, tmp_path):
     _no_network(monkeypatch)
     path = tmp_path / "figure.png"
     path.write_bytes(b"fake")
+    run = braven.init()
+    run.set_device("SENSOR-1")
 
-    braven.get_device("SENSOR-1").upload(path)
+    run.upload(path)
 
     assert "would upload('figure.png', device='SENSOR-1')" in capsys.readouterr().out
 
 
-def test_device_upload_from_a_direct_run_handle_raises(reset_pipeline_context, monkeypatch):
-    class _FakeRun:
-        def _log(self, *a, **k):
-            pass
+def test_created_run_upload_includes_device_key_when_set_device_active(monkeypatch, tmp_path):
+    # A direct-logging (created-mode) run's upload() supports set_device()
+    # too (ADR-0013 no longer restricts device-scoped uploads to pipeline
+    # scripts, now that config()/summary()/series() route onto the child the
+    # same way) — asserts the params sent, not a real network call.
+    run = braven.Run(mode="created", api_url="https://api.example", headers={}, experiment_id="exp_1")
+    run.set_device("SENSOR-1", "Photodiode")
+    path = tmp_path / "figure.png"
+    path.write_bytes(b"fake")
+    captured = {}
 
-    dev = braven.Device("SENSOR-1", run=_FakeRun())
-    with pytest.raises(RuntimeError, match="pipeline scripts"):
-        dev.upload("whatever.png")
+    def _fake_post(url, files=None, params=None, headers=None, timeout=None):
+        captured["params"] = params
+        return type("Resp", (), {"raise_for_status": lambda self: None})()
+
+    monkeypatch.setattr(braven.requests, "post", _fake_post)
+
+    run.upload(path)
+
+    assert captured["params"] == {"experiment_id": "exp_1", "device_key": "SENSOR-1", "device_type": "Photodiode"}
 
 
-def test_flush_metadata_with_no_context_is_a_noop_print(reset_pipeline_context, monkeypatch, capsys):
+def test_flush_with_no_context_is_a_noop_print(reset_pipeline_context, monkeypatch, capsys):
     _no_network(monkeypatch)
+    run = braven.init()
 
-    result = braven.flush_metadata(pipeline_id="pipe_1")
+    result = run.flush()
 
     assert result is None
-    assert "flush_metadata() — nothing to flush (local dry mode)" in capsys.readouterr().out
+    assert "flush() — nothing to flush (local dry mode)" in capsys.readouterr().out
 
 
 def test_log_artifact_with_no_context_prints_instead_of_raising(reset_pipeline_context, monkeypatch, capsys, tmp_path):
     _no_network(monkeypatch)
     path = tmp_path / "model.pkl"
     path.write_bytes(b"fake")
+    run = braven.init()
 
-    braven.log_artifact(path)
+    run.log_artifact(path)
 
-    assert "would log_artifact('model.pkl')" in capsys.readouterr().out
+    assert "would upload('model.pkl')" in capsys.readouterr().out
 
 
 def test_log_artifact_with_no_context_still_raises_on_missing_file(reset_pipeline_context, monkeypatch, tmp_path):
     _no_network(monkeypatch)
+    run = braven.init()
 
     with pytest.raises(FileNotFoundError):
-        braven.log_artifact(tmp_path / "missing.pkl")
+        run.log_artifact(tmp_path / "missing.pkl")
 
 
 def test_upload_path_with_no_context_prints_instead_of_raising(reset_pipeline_context, monkeypatch, capsys, tmp_path):
     _no_network(monkeypatch)
     path = tmp_path / "plot.png"
     path.write_bytes(b"fake")
+    run = braven.init()
 
-    braven.upload(path)
+    run.upload(path)
 
     assert "would upload('plot.png')" in capsys.readouterr().out
 
@@ -517,10 +533,11 @@ def test_upload_path_with_no_context_prints_instead_of_raising(reset_pipeline_co
 def test_upload_figure_with_no_context_saves_png_locally(reset_pipeline_context, monkeypatch, capsys, tmp_path):
     _no_network(monkeypatch)
     monkeypatch.chdir(tmp_path)
+    run = braven.init()
     fig, ax = plt.subplots()
     ax.plot([1, 2, 3], [1, 4, 9])
 
-    braven.upload(fig, "value_over_index.png")
+    run.upload(fig, "value_over_index.png")
     plt.close(fig)
 
     saved = tmp_path / braven._LOCAL_OUTPUT_DIR / "value_over_index.png"
@@ -533,13 +550,14 @@ def test_upload_figure_with_no_context_saves_png_locally(reset_pipeline_context,
 def test_upload_figure_with_no_context_does_not_overwrite_on_second_call(reset_pipeline_context, monkeypatch, tmp_path):
     _no_network(monkeypatch)
     monkeypatch.chdir(tmp_path)
+    run = braven.init()
     fig1, ax1 = plt.subplots()
     ax1.plot([1, 2], [1, 2])
     fig2, ax2 = plt.subplots()
     ax2.plot([3, 4], [3, 4])
 
-    braven.upload(fig1, "figure.png")
-    braven.upload(fig2, "figure.png")
+    run.upload(fig1, "figure.png")
+    run.upload(fig2, "figure.png")
     plt.close(fig1)
     plt.close(fig2)
 
@@ -551,42 +569,39 @@ def test_upload_figure_with_no_context_does_not_overwrite_on_second_call(reset_p
 def test_partial_context_still_raises_not_local_mode(reset_pipeline_context, monkeypatch):
     # Only experiment_id resolves, api_url doesn't — a real misconfiguration,
     # not a local script; must still raise loudly, not silently fall back.
-    monkeypatch.setattr(braven, "braven_experiment_id", "exp_123")
+    run = braven.init(experiment_id="exp_123")
 
     with pytest.raises(RuntimeError, match="api_url not set"):
-        braven.log_config("k", "v")
+        run.config("k", "v")
 
 
 def test_configured_context_is_unaffected_by_local_mode_change(reset_pipeline_context, monkeypatch):
     # Regression guard: a fully-configured context still queues for a real
     # flush rather than local-mode printing.
-    monkeypatch.setattr(braven, "braven_experiment_id", "exp_123")
-    monkeypatch.setattr(braven, "braven_api_url", "https://api.example.com")
+    run = braven.init(experiment_id="exp_123", api_url="https://api.example.com")
 
-    braven.log_config("lr", "0.001")
+    run.config("lr", "0.001")
 
-    assert braven._metadata_queue == [
-        {"key": "lr", "value": "0.001", "category": "config", "device_key": None, "device_type": None}
-    ]
+    assert run._metadata == {
+        (None, "lr"): {"key": "lr", "value": "0.001", "category": "config", "device_key": None, "device_type": None}
+    }
 
 
 # ---------------------------------------------------------------------------
-# Streaming mode (2026-08-22) — log_config()/log_summary() write immediately,
-# by default, alongside the buffered queue a real flush_metadata() still
-# needs at run end. requests.patch is monkeypatched (not hit for real) —
-# same "no real network" boundary the rest of this file keeps, just with a
-# recording fake instead of _no_network's failing one, since asserting the
-# call did/didn't happen IS the behavior under test here.
+# Streaming mode (2026-08-22) — config()/summary() write immediately, by
+# default, alongside the buffered set flush() still needs at run end.
+# requests.patch is monkeypatched (not hit for real) — same "no real
+# network" boundary the rest of this file keeps, just with a recording fake
+# instead of _no_network's failing one, since asserting the call did/didn't
+# happen IS the behavior under test here.
 # ---------------------------------------------------------------------------
 
-def _configure_pipeline_context(monkeypatch, *, pipeline_id="pipe_1"):
-    monkeypatch.setattr(braven, "braven_experiment_id", "exp_123")
-    monkeypatch.setattr(braven, "braven_api_url", "https://api.example.com")
-    monkeypatch.setattr(braven, "braven_pipeline_id", pipeline_id)
+def _pipeline_run(monkeypatch, *, pipeline_id="pipe_1"):
+    return braven.init(experiment_id="exp_123", api_url="https://api.example.com", pipeline_id=pipeline_id)
 
 
 def test_streaming_default_on_patches_experiment_level_entries_immediately(reset_pipeline_context, monkeypatch):
-    _configure_pipeline_context(monkeypatch)
+    run = _pipeline_run(monkeypatch)
     calls = []
 
     def _fake_patch(url, json=None, headers=None, timeout=None):
@@ -595,76 +610,85 @@ def test_streaming_default_on_patches_experiment_level_entries_immediately(reset
 
     monkeypatch.setattr(braven.requests, "patch", _fake_patch)
 
-    braven.log_config("lr", "0.001")
+    run.config("lr", "0.001")
 
     assert calls == [
         ("https://api.example.com/experiments/exp_123/pipeline-metadata/pipe_1",
          [{"key": "lr", "value": "0.001", "category": "config"}])
     ]
-    # Still queued too — flush_metadata() at run end stays the source of truth.
-    assert braven._metadata_queue == [
-        {"key": "lr", "value": "0.001", "category": "config", "device_key": None, "device_type": None}
-    ]
+    # Still queued too — flush() at run end stays the source of truth.
+    assert run._metadata == {
+        (None, "lr"): {"key": "lr", "value": "0.001", "category": "config", "device_key": None, "device_type": None}
+    }
 
 
 def test_streaming_disabled_never_hits_the_network(reset_pipeline_context, monkeypatch):
-    _configure_pipeline_context(monkeypatch)
-    braven.init_pipeline(stream=False)
+    run = _pipeline_run(monkeypatch)
+    run.settings(flush=False)
     _no_network(monkeypatch)
 
-    braven.log_config("lr", "0.001")  # must not raise
+    run.config("lr", "0.001")  # must not raise
 
-    assert braven._metadata_queue == [
-        {"key": "lr", "value": "0.001", "category": "config", "device_key": None, "device_type": None}
-    ]
+    assert run._metadata == {
+        (None, "lr"): {"key": "lr", "value": "0.001", "category": "config", "device_key": None, "device_type": None}
+    }
 
 
 def test_streaming_skips_device_tagged_entries(reset_pipeline_context, monkeypatch):
-    _configure_pipeline_context(monkeypatch)
+    run = _pipeline_run(monkeypatch)
     _no_network(monkeypatch)  # a device-scoped call must not hit the streaming endpoint
 
-    braven.get_device("SENSOR-1").log_summary("SNR", 14.2)
+    run.set_device("SENSOR-1")
+    run.summary("SNR", 14.2)
 
-    assert braven._metadata_queue == [
-        {"key": "SNR", "value": "14.2", "category": "summary", "device_key": "SENSOR-1", "device_type": None}
-    ]
+    assert run._metadata == {
+        ("SENSOR-1", "SNR"): {"key": "SNR", "value": "14.2", "category": "summary", "device_key": "SENSOR-1", "device_type": None}
+    }
 
 
 def test_streaming_skips_series_entries(reset_pipeline_context, monkeypatch):
-    _configure_pipeline_context(monkeypatch)
+    run = _pipeline_run(monkeypatch)
     _no_network(monkeypatch)  # series stays on the buffered path — no per-call R2 write
 
-    braven.log_series("trace", [1, 2, 3])
+    run.series("trace", [1, 2, 3])
 
-    assert len(braven._metadata_queue) == 1
-    assert braven._metadata_queue[0]["category"] == "series"
+    assert len(run._metadata) == 1
+    assert next(iter(run._metadata.values()))["category"] == "series"
 
 
 def test_streaming_failure_is_swallowed_not_raised(reset_pipeline_context, monkeypatch, capsys):
-    _configure_pipeline_context(monkeypatch)
+    run = _pipeline_run(monkeypatch)
 
     def _boom(*args, **kwargs):
         raise ConnectionError("network is down")
 
     monkeypatch.setattr(braven.requests, "patch", _boom)
 
-    braven.log_config("lr", "0.001")  # must not raise despite the streaming call failing
+    run.config("lr", "0.001")  # must not raise despite the streaming call failing
 
     assert "streaming flush skipped" in capsys.readouterr().out
-    assert braven._metadata_queue == [
-        {"key": "lr", "value": "0.001", "category": "config", "device_key": None, "device_type": None}
-    ]
+    assert run._metadata == {
+        (None, "lr"): {"key": "lr", "value": "0.001", "category": "config", "device_key": None, "device_type": None}
+    }
 
 
 def test_streaming_without_pipeline_id_is_a_noop_not_an_error(reset_pipeline_context, monkeypatch):
-    # braven_pipeline_id unset (e.g. a caller that never passed it) — streaming
-    # has nothing to PATCH against, so it must skip silently, not hit the network.
-    monkeypatch.setattr(braven, "braven_experiment_id", "exp_123")
-    monkeypatch.setattr(braven, "braven_api_url", "https://api.example.com")
+    # pipeline_id unset (e.g. a caller that never passed it) — streaming has
+    # nothing to PATCH against, so it must skip silently, not hit the network.
+    run = braven.init(experiment_id="exp_123", api_url="https://api.example.com")
     _no_network(monkeypatch)
 
-    braven.log_config("lr", "0.001")
+    run.config("lr", "0.001")
 
-    assert braven._metadata_queue == [
-        {"key": "lr", "value": "0.001", "category": "config", "device_key": None, "device_type": None}
-    ]
+    assert run._metadata == {
+        (None, "lr"): {"key": "lr", "value": "0.001", "category": "config", "device_key": None, "device_type": None}
+    }
+
+
+def test_settings_overrides_stream_interval(reset_pipeline_context, monkeypatch):
+    run = _pipeline_run(monkeypatch)
+    assert run._stream_interval == braven.DEVICE_STREAM_INTERVAL_S
+
+    run.settings(stream_interval=9.0)
+
+    assert run._stream_interval == 9.0

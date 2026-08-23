@@ -22,25 +22,31 @@ up automatically — no need to pass them around.
 ## Direct logging (wandb-style)
 
 The common case: a script you run yourself, logging config, metrics, and
-plots straight to Braven as it runs.
+plots straight to Braven as it runs. Every call goes through the `run`
+`braven.init()` gives you back:
 
 ```python
 import braven
 
 run = braven.init(name="My Experiment", company="My Company", project="My Project")
 
-braven.config("radius_um", 55.0)
-braven.config("gap_nm", 200.0)
+run.config("radius_um", 55.0)
+run.config("gap_nm", 200.0)
 
-braven.summary("q_factor", 18_400)
-braven.summary("extinction_ratio_dB", 22.1)
+run.summary("q_factor", 18_400)
+run.summary("extinction_ratio_dB", 22.1)
 
-braven.upload("spectrum.png")
-braven.finish()
+run.upload("spectrum.png")
+run.finish()
 ```
 
 `company`/`project` are only required if your API key can see more than one
 project — pass them to disambiguate.
+
+`init()` decides what to send immediately vs. batch: `flush=True` (the
+default) sends each `config()`/`summary()`/`series()` call right away; pass
+`flush=False` to only update the in-memory value and defer everything to the
+next `run.flush()` — cheaper when logging several keys back-to-back.
 
 ## Matplotlib figures
 
@@ -58,7 +64,7 @@ ax.plot(wavelengths_nm, through_db, label="Through port")
 ax.set_xlabel("Wavelength (nm)")
 ax.set_ylabel("Transmission (dB)")
 
-braven.upload(fig, name="spectrum.png")
+run.upload(fig, name="spectrum.png")
 ```
 
 This works the same way whether the figure came from a script you run
@@ -69,75 +75,73 @@ Prefer to log a plain array without a matplotlib figure at all?
 `plot_series()` does that directly:
 
 ```python
-braven.plot_series("snr_vs_temp", y=snr_values, x=temperatures, x_label="Temp (C)", y_label="SNR (dB)")
+run.plot_series("snr_vs_temp", y=snr_values, x=temperatures, x_label="Temp (C)", y_label="SNR (dB)")
 ```
 
-## Devices — multiple sensors/units in one pipeline run
+## Devices — multiple sensors/units in one run
 
 Tag a value with a stable per-device key and the KPI name stays the same
 across devices (no `SNR_dev1`, `SNR_dev2`) — the device becomes a separate
-coordinate instead of a suffix. In a **pipeline script**, each device also
-gets its own single-device Experiment under the run's Experiment (the
-"parent") — `get_device()` returns a handle scoped to it:
+coordinate instead of a suffix. `set_device()` retargets `run` onto that
+device's own child Experiment (ADR-0013) — every `config()`/`summary()`/
+`series()`/`plot_series()`/`upload()` call after it lands there instead of
+the parent, until `set_device(None)` returns `run` to parent-level:
 
 ```python
 for sensor_id, snr in results.items():
-    braven.get_device(sensor_id).log_summary("SNR", snr)
+    run.set_device(sensor_id)
+    run.summary("SNR", snr)
 
-braven.log_summary("max_device_mismatch", spread)  # parent-level, across all devices
-```
-
-Logging several values for the same device without threading a handle
-through every call? `set_device()` sets an ambient current device for
-subsequent bare calls, the device-scoped equivalent of how `braven.init()`
-sets the ambient current run:
-
-```python
-braven.set_device("SENSOR-4471")
-braven.log_config("gain_db", 12)
-braven.log_summary("SNR", 14.2)
-braven.upload(fig, name="spectrum.png")   # this device's own figure
-braven.set_device(None)                   # back to parent-level logging
+run.set_device(None)
+run.summary("max_device_mismatch", spread)  # parent-level, across all devices
 ```
 
 A device is auto-created on first sight and its history accumulates across
 experiments — pass an optional type on first use
-(`braven.get_device("SENSOR-4471", "Photodiode")`) to name what kind of
-device it is; it's ignored once the device already exists.
+(`run.set_device("SENSOR-4471", "Photodiode")`) to name what kind of device
+it is; it's ignored once the device already exists.
 
-A **direct-logging** Run's device handle (`run.get_device(key)`, not the
-module-level `get_device()`) has no parent/child concept — it still tags
-device-scoped values onto rows of that same Experiment; `Device.upload()`
-is pipeline-only.
-
-> `braven.device()` was renamed to `get_device()`/`set_device()` in 0.2.0 —
-> calling the old name now raises with migration guidance rather than
-> silently keeping the old shared-row behavior, since it changed what a
-> device-tagged value actually means (its own Experiment, not a tagged row).
+> `braven.device()`/`get_device()` were removed in 0.3.0 in favor of
+> `set_device()` — a device handle used to be a second object (`Device`,
+> distinct method names); now it's just `run` pointed at a different
+> Experiment, so every method (including `upload()`, previously
+> pipeline-only) works identically regardless of whether a device is active.
+> Calling the old names raises with migration guidance.
 
 ## Pipeline scripts (run by the Braven worker)
 
 If your script runs through Braven's Pipelines tab (server-side, executed by
 the Braven worker against uploaded files) rather than on your own machine,
-the SDK dispatches to the same functions automatically — no `braven.init()`
-call needed, and no credentials to manage (the worker supplies the
-experiment context):
+call `braven.init()` bare (no arguments) — it adopts the Experiment the
+platform already created, no credentials to manage:
 
 ```python
 import braven
 
-def process(braven=None):
-    braven.log_config("lr", "0.001")
-    braven.log_summary("acc", "0.94")
-    braven.log_artifact("plot.png")
+run = braven.init()
+run.config("lr", "0.001")
+run.summary("acc", "0.94")
+run.log_artifact("plot.png")
 
-    # Devices and matplotlib figures work exactly as in direct logging:
-    braven.get_device("SENSOR-1").log_summary("SNR", 14.2)
-    braven.upload(fig, name="spectrum.png")
+# Devices and matplotlib figures work exactly as in direct logging:
+run.set_device("SENSOR-1")
+run.summary("SNR", 14.2)
+run.upload(fig, name="spectrum.png")
 ```
 
+`run = braven.init()` also makes local iteration work: run this exact script
+standalone (`python script.py`, no worker involved) before pasting it into
+the webapp's Pipeline editor, and every call above prints what it would have
+done instead of raising — see "Local dry mode" in `braven.py`'s module
+docstring.
+
 `braven.files` (uploaded file → local temp path) and `braven.params`
-(extracted parameters) are populated by the worker before `process()` runs.
+(extracted parameters) are populated by the worker before your script runs.
+
+A pipeline script never passes `flush=`/`stream_interval=` to `init()`
+(it's called with no arguments) — call `run.settings(flush=False)` or
+`run.settings(stream_interval=5.0)` after the fact instead, if you need to
+change them.
 
 ## Querying experiments
 

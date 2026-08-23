@@ -1,19 +1,24 @@
 """
 braven.py — Python SDK for the Braven experiment tracker.
 
-DIRECT LOGGING (wandb-style)
-─────────────────────────────
+Every logging call goes through one `Run`, returned by `braven.init()`. The
+only thing that differs between a direct-logging script and a pipeline
+script is how the Experiment is identified — everything after that (config,
+summary, series, plots, uploads, devices) is the same object, same methods.
+
+DIRECT LOGGING (wandb-style, your own script)
+────────────────────────────────────────────────
 One-time setup:
     python -m braven login
 
 Then in any script:
     import braven
 
-    braven.init(name="My Experiment")
-    braven.config("learning_rate", 0.001)
-    braven.summary("accuracy", 0.94)
-    braven.upload("plot.png")
-    braven.finish()
+    run = braven.init(name="My Experiment")
+    run.config("learning_rate", 0.001)
+    run.summary("accuracy", 0.94)
+    run.upload("plot.png")
+    run.finish()
 
 QUERYING EXPERIMENTS
 ─────────────────────
@@ -27,26 +32,25 @@ PIPELINE SCRIPTS (run by the Braven worker)
 ─────────────────────────────────────────────
     import braven
 
-    def process(braven=None):
-        braven.log_config("lr", "0.001")
-        braven.log_summary("acc", "0.94")
-        braven.log_artifact("plot.png")
+    run = braven.init()   # adopts the Experiment the platform already created
+    run.config("lr", "0.001")
+    run.summary("acc", "0.94")
+    run.upload("plot.png")
+
+    # `run = braven.init()` also makes local iteration work: run the same
+    # script standalone (`python script.py`, no worker) before pasting it
+    # into the webapp editor, and every call above prints instead of raising.
 
 MULTIPLE DEVICES IN ONE PIPELINE RUN (ADR-0013)
 ──────────────────────────────────────────────
-    # Tag values with a stable per-device key; the KPI name stays the same for
-    # every device (no "SNR_dev1"), the device is a separate coordinate — and
-    # in a pipeline script, each device gets its own child Experiment under
-    # the run's (parent) Experiment.
+    # set_device() retargets `run` onto that device's own child Experiment —
+    # the KPI name stays the same for every device (no "SNR_dev1"), each
+    # device just gets its own child Experiment under the run's (parent) one.
     for sensor_id, snr in results.items():
-        braven.get_device(sensor_id).log_summary("SNR", snr)
-    braven.log_summary("max_device_mismatch", spread)   # parent-level
-
-    # Or ambiently, for several calls against the same device:
-    braven.set_device(sensor_id)
-    braven.log_summary("SNR", snr)
-    braven.upload(fig, name="spectrum.png")
-    braven.set_device(None)   # back to parent-level
+        run.set_device(sensor_id)
+        run.summary("SNR", snr)
+    run.set_device(None)                       # back to the parent
+    run.summary("max_device_mismatch", spread)  # parent-level
 """
 
 from __future__ import annotations
@@ -178,8 +182,7 @@ def _capture_script_info() -> dict:
 # change. plot_series() uses `plot::{name}::{idx}::y|x|meta`; the `{idx}` is a
 # per-name call counter (NOT in the original spec's literal `plot::{name}::y`)
 # — without it, a second plot_series() call with the same `name` would
-# overwrite the first trace's key, since both Run._metadata and the pipeline
-# _metadata_queue dedupe by exact key.
+# overwrite the first trace's key, since Run._metadata dedupes by exact key.
 # ---------------------------------------------------------------------------
 
 _plot_series_counters: dict[str, int] = {}
@@ -264,9 +267,8 @@ def _make_image_preview(file_path: Path) -> bytes | None:
 def _upload_file_parts(upload_name: str, fh, file_path: Path, content_type: str | None = None) -> dict:
     """The multipart `files=` dict for a /files upload: the file itself plus,
     for raster images, a generated `preview` part the backend stores beside
-    the original in R2 (see _make_image_preview). Every upload path — direct
-    Run.upload(), a pipeline's upload()/_pipeline_upload(), and
-    Analysis.upload() — routes through this one function so a preview is
+    the original in R2 (see _make_image_preview). Every upload path — Run.upload()
+    and Analysis.upload() — routes through this one function so a preview is
     generated the same way regardless of how the upload got here.
     `content_type` is passed through when the caller already resolved one
     (Analysis.upload() guesses from the filename so the backend doesn't
@@ -410,101 +412,208 @@ def _walk_matplotlib_figure(fig) -> list[dict]:
     return groups
 
 
+def _local_output_path(filename: str) -> Path:
+    """Next available path under ./braven_local_output/ for `filename`,
+    appending a numeric suffix on collision (figure_1.png, figure_2.png,
+    ...) rather than overwriting a previous local run's output — local
+    iteration commonly re-runs the same script repeatedly."""
+    out_dir = Path(_LOCAL_OUTPUT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    candidate = out_dir / filename
+    if not candidate.exists():
+        return candidate
+    stem, suffix = candidate.stem, candidate.suffix
+    n = 1
+    while True:
+        candidate = out_dir / f"{stem}_{n}{suffix}"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+def _describe_device_report(report: dict) -> str:
+    """One-line human summary of what a flush created / flagged (Spec device-policy
+    ticket 06), e.g. 'created 2 new devices: S-1, S-2; 1 type mismatch: …'."""
+    parts = []
+    keys = report.get("createdDeviceKeys") or []
+    types = report.get("createdTypeNames") or []
+    mism = report.get("typeMismatches") or []
+    if keys:
+        parts.append(f"created {len(keys)} new device(s): {', '.join(keys)}")
+    if types:
+        parts.append(f"created {len(types)} new type(s): {', '.join(types)}")
+    if mism:
+        joined = "; ".join(f"{m.get('key')} said '{m.get('requested')}' but is '{m.get('stored')}'" for m in mism)
+        parts.append(f"{len(mism)} device type mismatch(es): {joined}")
+    return "; ".join(parts)
+
+
+_LOCAL_OUTPUT_DIR = "braven_local_output"
+
+# Debounce interval for a device-scoped (set_device()-active) streaming
+# flush — see Run._queue_device_stream_entry's docstring for why device
+# entries are batched on a cadence instead of streamed one-by-one the way a
+# parent-level entry is. Overridable per run via
+# braven.init(stream_interval=...) or run.settings(stream_interval=...).
+DEVICE_STREAM_INTERVAL_S = 2.0
+
+
 # ---------------------------------------------------------------------------
-# Run — direct experiment logger
+# Run — the one logging handle, for both direct-logging and pipeline scripts
 # ---------------------------------------------------------------------------
+
 
 class Run:
-    """An active experiment being logged to directly.
+    """A live handle to one Experiment. Returned by braven.init() — either
+    freshly created (direct logging: `braven.init(name=..., project=...)`)
+    or adopted from a worker-run pipeline's already-existing Experiment
+    (`braven.init()`, bare). Every method below works identically regardless
+    of which one — the only difference between the two is how the Experiment
+    was identified in the first place.
 
-    Returned by ``braven.init()``. You can use the module-level helpers
-    (``braven.config()``, ``braven.summary()``, etc.) instead of calling
-    methods on this object — both work identically.
+        run = braven.init(name="Firefly temp sweep")   # or braven.init() in a pipeline
+        run.config("ambient_C", 21.0)                    # parent-level
+        run.summary("max_mismatch", 3.1)                 # parent-level
+
+        run.set_device("SENSOR-4471")                    # retarget onto a child Experiment
+        run.summary("SNR", 14.2)                         # this device's own child
+        run.upload(fig, "spectrum.png")                  # also the child's
+        run.set_device(None)                             # back to the parent
+
+        run.finish()
+
+    Do not construct directly — always via braven.init().
     """
 
     def __init__(
         self,
-        api_url: str,
-        api_key: str,
-        project_id: str,
+        *,
+        mode: str,
+        api_url: str | None,
+        headers: dict,
+        experiment_id: str | None,
         name: str | None = None,
-        notes: str | None = None,
+        pipeline_id: str | None = None,
+        flush: bool = True,
+        stream_interval: float | None = None,
     ) -> None:
-        self._base_url = api_url.rstrip("/")
-        self._headers = {
-            "Authorization": f"Bearer {api_key}",
-            "X-Project-Id": project_id,
-        }
-        # (device_key, key) → {key, value, category, device_key}. device_key is
-        # None for experiment-level values; set for a device slice (Spec 04), so
-        # two devices' "SNR" are distinct entries rather than one overwriting the
-        # other. The backend resolves device_key → a persistent device record.
-        self._metadata: dict[tuple[str | None, str], dict] = {}
-        self._devices: dict[str, "Device"] = {}
+        self._mode = mode  # "created" (direct-logging) | "adopted" (pipeline)
+        self._base_url = api_url.rstrip("/") if api_url else None
+        self._headers = headers
+        self.id = experiment_id
+        self.name = name
+        self._pipeline_id = pipeline_id
+        self._auto_flush = flush
+        self._stream_interval = DEVICE_STREAM_INTERVAL_S if stream_interval is None else stream_interval
 
+        # (device_key, key) → {key, value, category, device_key, device_type}.
+        # device_key is None for parent-level values; set while set_device()
+        # is active, so two devices' "SNR" are distinct entries rather than
+        # one overwriting the other. The backend resolves device_key to that
+        # device's own child Experiment (ADR-0013).
+        self._metadata: dict[tuple[str | None, str], dict] = {}
+        self._device_target: str | None = None
+        self._device_target_type: str | None = None
+        self._device_stream_queue: list[dict] = []
+        self._device_stream_last_flush_at: float = 0.0
+
+    # ------------------------------------------------------------------
+    # Construction (called by braven.init() — not part of the public API)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _create(cls, name, notes, project, company, flush, stream_interval) -> "Run":
+        cfg = _load_config()
+        project_id = _resolve_project_id(cfg, company=company, project=project)
+        headers = {"Authorization": f"Bearer {cfg['api_key']}", "X-Project-Id": project_id}
         payload = {"name": name, "notes": notes}
         payload.update(_capture_script_info())
-
-        resp = requests.post(
-            f"{self._base_url}/experiments",
-            json=payload,
-            headers=self._headers,
-            timeout=30,
-        )
+        resp = requests.post(f"{cfg['api_url'].rstrip('/')}/experiments", json=payload, headers=headers, timeout=30)
         resp.raise_for_status()
         data = resp.json()
-        self.id: str = data["id"]
-        self.name: str | None = data.get("name")
+        return cls(
+            mode="created",
+            api_url=cfg["api_url"],
+            headers=headers,
+            experiment_id=data["id"],
+            name=data.get("name"),
+            flush=flush,
+            stream_interval=stream_interval,
+        )
+
+    @classmethod
+    def _adopted(cls, experiment_id, api_url, watcher_secret, pipeline_id, flush, stream_interval) -> "Run":
+        headers = {"Authorization": f"Bearer {watcher_secret}"} if watcher_secret else {}
+        return cls(
+            mode="adopted",
+            api_url=api_url,
+            headers=headers,
+            experiment_id=experiment_id,
+            pipeline_id=pipeline_id,
+            flush=flush,
+            stream_interval=stream_interval,
+        )
+
+    @property
+    def _local_dry_mode(self) -> bool:
+        # Only possible for an adopted (pipeline) run: a direct-logging Run
+        # always has a real id/base_url by the time __init__ returns (POST
+        # already succeeded), or __init__ itself raised. See the module docs
+        # ("Local dry mode") below for why this exists. NEITHER id nor
+        # base_url resolving is a genuine local script (dry mode); exactly
+        # ONE resolving is a real misconfiguration, not a local script, and
+        # raises loudly instead of silently degrading into dry mode.
+        if self._mode != "adopted":
+            return False
+        has_id, has_url = bool(self.id), bool(self._base_url)
+        if has_id and has_url:
+            return False
+        if not has_id and not has_url:
+            return True
+        missing = "experiment_id" if not has_id else "api_url"
+        raise RuntimeError(
+            f"braven {missing} not set. The worker should have called braven.init() with it, "
+            f"or set BRAVEN_{missing.upper()} in the environment."
+        )
+
+    # ------------------------------------------------------------------
+    # Settings
+    # ------------------------------------------------------------------
+
+    def settings(self, flush: bool | None = None, stream_interval: float | None = None) -> None:
+        """Change run-level settings after construction. Mainly for pipeline
+        scripts: `braven.init()` there takes no arguments (it adopts the
+        Experiment the platform already created), so this is how a pipeline
+        script opts out of streaming or widens the device-scoped debounce
+        interval. A direct-logging script can just pass these to init()
+        instead. Only non-None arguments are changed."""
+        if flush is not None:
+            self._auto_flush = flush
+        if stream_interval is not None:
+            self._stream_interval = stream_interval
 
     # ------------------------------------------------------------------
     # Logging
     # ------------------------------------------------------------------
 
-    def config(self, key: str, value, flush: bool = True) -> None:
-        """Log an input / configuration parameter (experiment-level).
+    def config(self, key: str, value) -> None:
+        """Log an input / configuration parameter. Targets the parent
+        Experiment, or the device set by set_device() if one is active."""
+        self._log(key, value, "config")
 
-        Each call PUTs the full metadata set immediately by default (~1.5s
-        measured in production — see ADR-0002's implementation note in
-        braven-mvp's docs/adr/, same underlying cost as upload()'s
-        interactive=False fix) — fine for one-off values, but logging several
-        config keys back-to-back at startup pays that cost once per key. Pass
-        `flush=False` to only update the in-memory value and defer the PUT;
-        the next flush=True call (or an explicit .flush()) sends everything
-        accumulated so far in one PUT instead of one per key.
-        """
-        self._log(key, value, "config", flush=flush)
+    log_config = config  # deprecated alias
 
-    def summary(self, key: str, value, flush: bool = True) -> None:
-        """Log an output metric (experiment-level). See config()'s docstring
-        for `flush` — the same one-PUT-per-key cost applies here."""
-        self._log(key, value, "summary", flush=flush)
+    def summary(self, key: str, value) -> None:
+        """Log an output metric. See config()."""
+        self._log(key, value, "summary")
 
-    def flush(self) -> None:
-        """Send any pending flush=False config()/summary() values now, in one
-        PUT. No-op if nothing is pending (also called automatically by
-        finish())."""
-        self._flush()
+    log_summary = summary  # deprecated alias
 
-    def get_device(self, key: str, type: str | None = None) -> "Device":
-        """Return a device-scoped handle within this experiment (Spec 04;
-        renamed from device() in 0.2.0 — see the module-level device()'s
-        docstring for why). Everything logged on it is tagged with `key` (a
-        stable per-project device identifier); the backend resolves that to a
-        persistent device record, auto-created on first sight. An optional
-        `type` names the device type to create it under when it's new
-        (ignored for an existing device — a device is never re-typed).
-        Memoised per run, so repeated calls with the same key return the same
-        handle (the first call's type wins).
+    def series(self, key: str, values: list) -> None:
+        """Log a numeric data series (stored as JSON). See config()."""
+        self._log(key, json.dumps(values), "series")
 
-        Note: unlike the module-level get_device()/set_device() (pipeline
-        scripts, ADR-0013), a direct-logging Run has no parent/child
-        Experiment concept — this still tags device-scoped values onto rows
-        of the SAME Experiment (Spec 04), and Device.upload() isn't
-        supported from a Run's device handle (pipeline-only)."""
-        key = str(key)
-        if key not in self._devices:
-            self._devices[key] = Device(key, run=self, type=type)
-        return self._devices[key]
+    log_series = series  # deprecated alias
 
     def plot_series(
         self,
@@ -519,27 +628,41 @@ class Run:
         the same `name` and a distinct `y_label` to group traces onto one chart."""
         self._log_many(_build_plot_series_entries(name, y, x, x_label, y_label, mode))
 
-    def upload(self, path_or_fig, name: str | None = None, interactive: bool = True) -> None:
-        """Upload a file and attach it to this experiment.
+    def set_device(self, key: str | None, type: str | None = None) -> None:
+        """Point this run at a device's own child Experiment (ADR-0013):
+        every config()/summary()/series()/plot_series()/upload() call after
+        this targets that child instead of the parent, until
+        set_device(None) returns to parent-level. Resolves-or-creates the
+        device (and its child Experiment) on the backend on first sight;
+        `type` names the device type to create it under — applied only when
+        the device is new, ignored (never re-typing) for one that already
+        exists.
 
-        `path_or_fig` may be a file path, or a live matplotlib Figure — in the latter
-        case the PNG is saved the same way `fig.savefig()` would, and (when
-        `interactive` is True, the default) the SDK also attempts to extract an
-        interactive companion series from the figure's line/scatter data
-        (best-effort, never blocks the upload).
+            run.set_device("SENSOR-4471")
+            run.summary("SNR", 14.2)   # this device's own child Experiment
+            run.summary("SNR", 9.8)    # still SENSOR-4471
+            run.set_device(None)       # back to the parent
+        """
+        self._device_target = str(key) if key is not None else None
+        self._device_target_type = type if key is not None else None
+
+    def upload(self, path_or_fig, name: str | None = None, interactive: bool = True) -> None:
+        """Upload a file and attach it to this Experiment (the parent, or
+        the device set by set_device() if one is active).
+
+        `path_or_fig` may be a file path, or a live matplotlib Figure — in
+        the latter case the PNG is saved the same way fig.savefig() would,
+        and (when `interactive` is True, the default) the SDK also attempts
+        to extract an interactive companion series from the figure's
+        line/scatter data (best-effort, never blocks the upload).
 
         Pass `interactive=False` to skip that extraction — it costs an extra
-        metadata flush to the backend (ADR-0002's deferred opt-out; see the
-        ADR for why per-line identity was rejected). Worth setting for a figure
-        re-uploaded rapidly in a loop (e.g. a live-updating plot), where only
-        the final frame's interactive data is likely to matter.
+        metadata flush to the backend. Worth setting for a figure
+        re-uploaded rapidly in a loop (e.g. a live-updating plot), where
+        only the final frame's interactive data is likely to matter.
         """
         fig = path_or_fig if _is_matplotlib_figure(path_or_fig) else None
-        tmp_path: Path | None = None
         if fig is not None:
-            tmp_path = Path(tempfile.mktemp(suffix=".png"))
-            fig.savefig(tmp_path, dpi=150, bbox_inches="tight")
-            file_path = tmp_path
             upload_name = name or "figure.png"
         else:
             file_path = Path(path_or_fig)
@@ -547,11 +670,36 @@ class Run:
                 raise FileNotFoundError(f"upload: file not found: {file_path}")
             upload_name = name or file_path.name
 
+        device_key, device_type = self._device_target, self._device_target_type
+
+        if self._local_dry_mode:
+            suffix = f", device={device_key!r}" if device_key else ""
+            if fig is not None:
+                out_path = _local_output_path(upload_name)
+                fig.savefig(out_path, dpi=150, bbox_inches="tight")
+                print(f"[braven:local] saved figure to {out_path} (upload skipped{suffix})", flush=True)
+            else:
+                print(f"[braven:local] would upload({upload_name!r}{suffix})", flush=True)
+            return
+
+        tmp_path: Path | None = None
+        if fig is not None:
+            tmp_path = Path(tempfile.mktemp(suffix=".png"))
+            fig.savefig(tmp_path, dpi=150, bbox_inches="tight")
+            file_path = tmp_path
+
+        params: dict = {"experiment_id": self.id}
+        if self._pipeline_id:
+            params["pipeline_id"] = self._pipeline_id
+        if device_key:
+            params["device_key"] = device_key
+            if device_type:
+                params["device_type"] = device_type
         with open(file_path, "rb") as fh:
             resp = requests.post(
                 f"{self._base_url}/files",
                 files=_upload_file_parts(upload_name, fh, file_path),
-                params={"experiment_id": self.id},
+                params=params,
                 headers=self._headers,
                 timeout=120,
             )
@@ -566,26 +714,75 @@ class Run:
         if fig is not None and interactive:
             self._log_matplotlib_series(fig, upload_name)
 
+    def log_artifact(self, path: Union[str, Path], name: str | None = None) -> None:
+        """Upload a file attached to this Experiment. An alias for upload()
+        kept for scripts written before upload() accepted matplotlib
+        Figures too — identical behavior for a plain file path."""
+        self.upload(path, name)
+
+    def flush(self) -> None:
+        """Send any pending logged values now. No-op if nothing is pending.
+        Called automatically by finish(). Returns the device created-report
+        (new devices/types, type mismatches — see ADR-0013) for a pipeline
+        run, or None."""
+        return self._flush()
+
     def finish(self) -> None:
-        """Flush metadata (idempotent). Called automatically by braven.finish()."""
+        """Flush and close out this run (idempotent)."""
         self._flush()
+
+    def __repr__(self) -> str:
+        if self._mode == "created":
+            return f"Run(name={self.name!r}, id={self.id!r})"
+        return f"Run(pipeline, id={self.id!r})"
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
-    def _log(self, key: str, value, category: str, device_key: str | None = None, device_type: str | None = None, flush: bool = True) -> None:
-        self._metadata[(device_key, key)] = {"key": key, "value": str(value), "category": category, "device_key": device_key, "device_type": device_type}
-        if flush:
-            self._flush()
+    def _record(self, key: str, value, category: str, device_key: str | None, device_type: str | None) -> None:
+        """Buffer one entry into self._metadata (and print the local-dry-mode
+        line if applicable). Pure bookkeeping — never sends anything."""
+        self._metadata[(device_key, key)] = {
+            "key": key, "value": str(value), "category": category,
+            "device_key": device_key, "device_type": device_type,
+        }
+        if self._local_dry_mode:
+            suffix = f", device={device_key!r}" if device_key else ""
+            print(f"[braven:local] would {category}({key!r}, {value!r}{suffix})", flush=True)
 
-    def _log_many(self, entries: list[tuple[str, str, str]], device_key: str | None = None, device_type: str | None = None) -> None:
-        """Like _log(), but for multiple (key, value, category) triples flushed once —
-        avoids one PUT per key when writing several related entries (e.g. a
-        plot_series() call or a matplotlib figure's extracted traces)."""
+    def _log(self, key: str, value, category: str) -> None:
+        device_key, device_type = self._device_target, self._device_target_type
+        self._record(key, value, category, device_key, device_type)
+        if self._mode == "created":
+            if self._auto_flush:
+                self._flush()
+            return
+        if self._local_dry_mode or not self._auto_flush or category == "series":
+            return
+        if device_key is None:
+            # Parent-level: stream this one entry immediately — best-effort
+            # live preview. Hits a narrower endpoint (PATCH .../pipeline-
+            # metadata/{id}, an incremental upsert scoped to just this key)
+            # than flush()'s PUT, which re-derives and rewrites the WHOLE
+            # accumulated flush every call — fine once at the end, not once
+            # per log statement (O(n²) over a run otherwise).
+            self._stream_one_entry(key, str(value), category)
+        else:
+            self._queue_device_stream_entry(key, str(value), category, device_key, device_type)
+
+    def _log_many(self, entries: list[tuple[str, str, str]]) -> None:
+        """Like _log(), but for several (key, value, category) triples
+        flushed together — a plot_series() call or a matplotlib figure's
+        extracted traces. Always category="series", which never streams
+        per-call (see _log) regardless of the run's flush setting — buffered
+        here for the next flush()/finish() (or the parent's next flush()
+        call, for a created-mode run with flush=True)."""
+        device_key, device_type = self._device_target, self._device_target_type
         for key, value, category in entries:
-            self._metadata[(device_key, key)] = {"key": key, "value": value, "category": category, "device_key": device_key, "device_type": device_type}
-        self._flush()
+            self._record(key, value, category, device_key, device_type)
+        if self._mode == "created" and self._auto_flush:
+            self._flush()
 
     def _log_matplotlib_series(self, fig, image_name: str) -> None:
         """Best-effort: extract interactive series data from a matplotlib figure and log
@@ -615,7 +812,13 @@ class Run:
         except Exception as e:
             print(f"[braven] matplotlib series extraction skipped: {e}")
 
-    def _flush(self) -> None:
+    def _flush(self) -> dict | None:
+        if self._mode == "created":
+            self._flush_created()
+            return None
+        return self._flush_adopted()
+
+    def _flush_created(self) -> None:
         if not self._metadata:
             return
         resp = requests.put(
@@ -626,106 +829,110 @@ class Run:
         )
         resp.raise_for_status()
 
-    def __repr__(self) -> str:
-        return f"Run(name={self.name!r}, id={self.id!r})"
+    def _flush_adopted(self) -> dict | None:
+        """Atomically replace all of this run's metadata (called by the
+        worker at run end, via braven.init(...).flush()). Returns the
+        backend's device created-report ({createdDeviceKeys, createdTypeNames,
+        typeMismatches}) so the worker can fold it into the run result, and
+        prints a human line to stdout when the run created/flagged devices.
+        Returns None when there's nothing to flush."""
+        if self._local_dry_mode:
+            print("[braven:local] flush() — nothing to flush (local dry mode)", flush=True)
+            return None
+        entries = list(self._metadata.values())
+        if not entries:
+            return None
+        if not self._pipeline_id:
+            raise RuntimeError("flush(): pipeline_id is required")
+        resp = requests.put(
+            f"{self._base_url}/experiments/{self.id}/pipeline-metadata/{self._pipeline_id}",
+            json=entries,
+            headers=self._headers,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        try:
+            report = resp.json().get("device_report")
+        except Exception:
+            report = None
+        if report:
+            desc = _describe_device_report(report)
+            if desc:
+                print(f"[braven] {desc}", flush=True)
+        return report
 
-
-# ---------------------------------------------------------------------------
-# Device — a device-scoped logging handle within an experiment (Spec 04)
-# ---------------------------------------------------------------------------
-
-class Device:
-    """A device within an experiment. Values logged here are tagged with the
-    device's stable key and resolved by the backend to a persistent device
-    record (auto-created on first sight), so a physical sensor accumulates
-    history across experiments.
-
-    Obtain one via ``run.get_device(key)`` (direct logging) or module-level
-    ``braven.get_device(key)`` (pipeline scripts). The rule is simple:
-
-        dev = run.get_device("SENSOR-4471")
-        dev.log_summary("SNR", 14.2)     # this device's SNR
-        run.log_summary("max_mismatch", 3.1)  # experiment-level (all devices)
-
-    ``dev.*`` is device-scoped; ``run.*`` / ``braven.*`` stay experiment-level.
-    The KPI name never changes ("SNR" stays "SNR" for every device) — the device
-    is a separate coordinate, not a suffix.
-    """
-
-    def __init__(self, key: str, *, run: "Run | None" = None, type: str | None = None) -> None:
-        # run set → direct-logging mode (writes via the Run); run None → pipeline
-        # mode (writes onto the worker's pipeline metadata queue). `type` is an
-        # optional device-type name, applied only if the device is created here.
-        self.key = str(key)
-        self._run = run
-        self.type = type
-
-    def log_config(self, key: str, value) -> None:
-        """Log an input / configuration parameter for this device."""
-        self._log(key, value, "config")
-
-    def log_summary(self, key: str, value) -> None:
-        """Log an output metric for this device."""
-        self._log(key, value, "summary")
-
-    def log_series(self, key: str, values: list) -> None:
-        """Log a numeric data series for this device (stored as JSON)."""
-        self._log(key, json.dumps(values), "series")
-
-    # Direct-logging aliases, mirroring Run.config/Run.summary naming.
-    config = log_config
-    summary = log_summary
-
-    def plot_series(
-        self,
-        name: str,
-        y: list,
-        x: list | None = None,
-        x_label: str | None = None,
-        y_label: str | None = None,
-        mode: str = "line",
-    ) -> None:
-        """Log a labeled interactive plot series for this device."""
-        entries = _build_plot_series_entries(name, y, x, x_label, y_label, mode)
-        if self._run is not None:
-            self._run._log_many(entries, device_key=self.key, device_type=self.type)
-        else:
-            for k, v, c in entries:
-                _pipeline_log(k, v, c, device_key=self.key, device_type=self.type)
-
-    def upload(self, path_or_fig, name: str | None = None, interactive: bool = True) -> None:
-        """Upload a file (or a live matplotlib Figure — see Run.upload) attached
-        to this device's own child Experiment (ADR-0013). Pipeline scripts only
-        (via braven.get_device()) — a direct-logging Run's device handle
-        (run.get_device()) still uses Spec 04's device-tagged-row model for
-        every other method on this class, so a device-scoped upload spinning
-        up a child Experiment nothing else about that Run knows about would be
-        a silent, confusing split; this raises instead.
-
-        `interactive=False` skips the companion-series extraction for a
-        matplotlib Figure — see Run.upload()."""
-        if self._run is not None:
-            raise RuntimeError(
-                "Device.upload() is only supported for pipeline scripts (braven.get_device()), "
-                "not a direct-logging Run's device handle (run.get_device())."
+    def _stream_one_entry(self, key: str, value: str, category: str) -> None:
+        """Best-effort immediate write for one parent-level, non-series entry
+        (streaming mode) — see _flush_adopted's docstring for the buffered,
+        source-of-truth path this is a live-preview shortcut for. Never
+        raises: a transient failure here just means this value shows up once
+        the run finishes instead of live."""
+        if not self._pipeline_id:
+            return
+        try:
+            resp = requests.patch(
+                f"{self._base_url}/experiments/{self.id}/pipeline-metadata/{self._pipeline_id}",
+                json=[{"key": key, "value": value, "category": category}],
+                headers=self._headers,
+                timeout=15,
             )
-        _pipeline_upload(path_or_fig, name, device_key=self.key, device_type=self.type, interactive=interactive)
+            resp.raise_for_status()
+        except Exception as e:
+            print(f"[braven] streaming flush skipped for {key!r}: {e}", flush=True)
 
-    def _log(self, key: str, value, category: str) -> None:
-        if self._run is not None:
-            self._run._log(key, value, category, device_key=self.key, device_type=self.type)
-        else:
-            _pipeline_log(key, str(value), category, device_key=self.key, device_type=self.type)
+    def _queue_device_stream_entry(
+        self, key: str, value: str, category: str, device_key: str, device_type: str | None
+    ) -> None:
+        """Buffer one device-scoped entry for the debounced flush and send the
+        batch once self._stream_interval has elapsed since the last one —
+        bounds call volume, not latency: a wafer run calling config()/
+        summary() per die would otherwise mean hundreds-thousands of
+        streaming round trips regardless of how fast any one of them is."""
+        self._device_stream_queue = [
+            e for e in self._device_stream_queue if not (e["key"] == key and e.get("device_key") == device_key)
+        ]
+        self._device_stream_queue.append(
+            {"key": key, "value": value, "category": category, "device_key": device_key, "device_type": device_type}
+        )
+        now = time.time()
+        if now - self._device_stream_last_flush_at >= self._stream_interval:
+            self._flush_device_stream_queue()
+            self._device_stream_last_flush_at = now
 
-    def __repr__(self) -> str:
-        return f"Device(key={self.key!r})"
+    def _flush_device_stream_queue(self) -> None:
+        """Best-effort immediate write of every currently-buffered device-scoped
+        entry, in one PATCH — the batch may span several devices, each
+        resolved to its own child Experiment server-side. Clears the buffer
+        on success; a transient failure leaves entries queued for the next
+        debounce tick (or the final flush(), the source of truth regardless)
+        rather than dropping them. Never raises."""
+        if not self._device_stream_queue or not self._pipeline_id:
+            return
+        batch = self._device_stream_queue
+        try:
+            resp = requests.patch(
+                f"{self._base_url}/experiments/{self.id}/pipeline-metadata/{self._pipeline_id}",
+                json=batch,
+                headers=self._headers,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            self._device_stream_queue = []
+        except Exception as e:
+            print(f"[braven] device-scoped streaming flush skipped ({len(batch)} entries): {e}", flush=True)
 
 
 # ---------------------------------------------------------------------------
-# Module-level API (wandb-style)
+# braven.init() — the one entry point
 # ---------------------------------------------------------------------------
 
-_current_run: Run | None = None
+# The current pipeline's adopted Run, if any — set once by the worker's own
+# braven.init(experiment_id=..., ...) call (executor.py) before the script
+# runs, and returned again by the script's own bare `run = braven.init()`
+# (the "adopt-first" rule). Also what a bare init() falls back to resolving
+# from BRAVEN_* environment variables when nothing has configured this yet —
+# see "Local dry mode" below.
+_adopted_run: Run | None = None
 
 
 def init(
@@ -733,31 +940,87 @@ def init(
     notes: str | None = None,
     project: str | None = None,
     company: str | None = None,
+    flush: bool = True,
+    stream_interval: float | None = None,
+    *,
+    experiment_id: str | None = None,
+    api_url: str | None = None,
+    watcher_secret: str | None = None,
+    user_id: str | None = None,
+    pipeline_id: str | None = None,
+    stream: bool | None = None,
 ) -> Run:
-    """Create a new experiment and set it as the active run.
+    """Create or adopt the Run this script logs to.
 
-    Credentials are read automatically from ~/.braven/config.json.
-    Run ``python -m braven login`` once to set them up.
+    Direct logging (your own script) — pass at least one of name/notes/
+    project/company, always creates a new Experiment:
+        run = braven.init(name="My Experiment")
 
-    Args:
-        name:    Experiment name shown in the UI.
-        notes:   Optional description.
-        project: Project name (as shown in Braven). Required if you belong
-                 to more than one project.
-        company: Company name. Only needed to disambiguate projects with
-                 the same name across companies.
+    Pipeline scripts (run by the Braven worker) — call bare, no arguments:
+        run = braven.init()
+    This adopts the Experiment the worker already created (no credentials or
+    project needed) — including when you run the same script standalone,
+    with no worker around, for local iteration: see "Local dry mode" below.
+
+    `flush` (default True) controls whether config()/summary()/series()/
+    plot_series() calls send immediately or only join the buffered flush()/
+    finish() — pass False to batch several calls into one write. Pass
+    `stream_interval` to override how often a pipeline run's device-scoped
+    (set_device()-active) entries are batch-flushed (default
+    DEVICE_STREAM_INTERVAL_S seconds). A pipeline script, which calls
+    init() with no arguments, sets these after construction instead —
+    see Run.settings().
+
+    The keyword-only experiment_id/api_url/watcher_secret/user_id/
+    pipeline_id/stream arguments are how the worker itself configures the
+    pipeline context (executor.py) — a script never needs to pass these.
+    `stream` is a deprecated alias for `flush`.
     """
-    global _current_run
-    cfg = _load_config()
-    project_id = _resolve_project_id(cfg, company=company, project=project)
-    _current_run = Run(
-        api_url=cfg["api_url"],
-        api_key=cfg["api_key"],
-        project_id=project_id,
-        name=name,
-        notes=notes,
+    global _adopted_run
+    if stream is not None:
+        flush = stream
+
+    if name is not None or notes is not None or project is not None or company is not None:
+        return Run._create(name, notes, project, company, flush, stream_interval)
+
+    if experiment_id is not None:
+        # The worker's own once-per-run call (executor.py) — always builds a
+        # fresh adopted Run for this run. api_url/watcher_secret still fall
+        # back to environment variables even here, same as the bare-call
+        # branch below, in case a caller passes experiment_id explicitly but
+        # relies on the environment for the rest.
+        _adopted_run = Run._adopted(
+            experiment_id,
+            api_url or os.environ.get("BRAVEN_API_URL"),
+            watcher_secret or os.environ.get("BRAVEN_WATCHER_SECRET") or os.environ.get("WATCHER_SECRET"),
+            pipeline_id,
+            flush,
+            stream_interval,
+        )
+        return _adopted_run
+
+    if _adopted_run is not None:
+        # A pipeline script's own bare `run = braven.init()` — adopt what the
+        # worker already configured above.
+        return _adopted_run
+
+    # Nothing configured yet in this process — either a user manually
+    # replicating a pipeline run locally (BRAVEN_* environment variables
+    # set), or a pipeline script being iterated on standalone with no worker
+    # around at all, in which case nothing resolves and every logging call
+    # below prints what it would have done instead of raising (see "Local
+    # dry mode"). A *partially* configured environment (one variable set,
+    # the other not) is a real misconfiguration, not a local script — the
+    # first genuinely network-facing call still raises via the missing field.
+    _adopted_run = Run._adopted(
+        os.environ.get("BRAVEN_EXPERIMENT_ID"),
+        api_url or os.environ.get("BRAVEN_API_URL"),
+        watcher_secret or os.environ.get("BRAVEN_WATCHER_SECRET") or os.environ.get("WATCHER_SECRET"),
+        pipeline_id,
+        flush,
+        stream_interval,
     )
-    return _current_run
+    return _adopted_run
 
 
 def _resolve_project_id(cfg: dict, company: str | None, project: str | None) -> str:
@@ -768,468 +1031,47 @@ def _resolve_project_id(cfg: dict, company: str | None, project: str | None) -> 
     if project is None and company is None:
         raise RuntimeError(
             "Specify company and project in braven.init():\n"
-            '  braven.init(name="...", company="My Company", project="My Project")'
+            '    braven.init(name="My Experiment", company="My Company", project="My Project")\n'
+            "(project alone is enough if it's unique across your companies)"
         )
-
-    api_url = cfg["api_url"]
     headers = {"Authorization": f"Bearer {cfg['api_key']}"}
+    resp = requests.get(f"{cfg['api_url'].rstrip('/')}/projects", headers=headers, timeout=30)
+    resp.raise_for_status()
+    projects = resp.json()
 
-    # Fetch all companies the API key has access to
-    try:
-        resp = requests.get(f"{api_url}/companies", headers=headers, timeout=10)
-        resp.raise_for_status()
-        all_companies = resp.json()
-    except requests.HTTPError as e:
-        raise RuntimeError(
-            f"Could not fetch companies from {api_url}: {e}\n"
-            "Check that your API key is valid."
-        ) from e
-
-    # Filter by company name (case-insensitive)
+    candidates = projects
     if company is not None:
-        matching_companies = [c for c in all_companies if c["name"].lower() == company.lower()]
-    else:
-        matching_companies = all_companies
+        candidates = [p for p in candidates if (p.get("company_name") or "").lower() == company.lower()]
+    if project is not None:
+        candidates = [p for p in candidates if (p.get("name") or "").lower() == project.lower()]
 
-    if not matching_companies:
-        available = [c["name"] for c in all_companies]
-        raise RuntimeError(
-            f"Company {company!r} not found.\n"
-            f"Available companies: {available}"
-        )
-
-    # For each matching company, search for the project by name
-    found: list[tuple[str, str, str]] = []  # (company_name, project_id, project_name)
-    for comp in matching_companies:
-        try:
-            resp = requests.get(
-                f"{api_url}/projects",
-                headers=headers,
-                params={"company_id": comp["id"]},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            projs = resp.json()
-        except Exception:
-            continue
-
-        for p in projs:
-            if project is None or p["name"].lower() == project.lower():
-                found.append((comp["name"], p["id"], p["name"]))
-
-    if not found:
-        raise RuntimeError(
-            f"Project {project!r} not found"
-            + (f" in company {company!r}" if company else "")
-            + ".\n"
-            "Make sure the company and project names match exactly what you see in the Braven UI."
-        )
-    if len(found) > 1:
-        raise RuntimeError(
-            f"Multiple projects match — add company= to disambiguate:\n"
-            + "\n".join(f'  company="{c}", project="{pn}"' for c, _, pn in found)
-        )
-    return found[0][1]
-
-
-def config(key: str, value, flush: bool = True) -> None:
-    """Log an input / configuration parameter on the active run. See
-    Run.config()'s docstring for `flush` — pass False when logging several
-    keys back-to-back to send them in one PUT instead of one per key."""
-    if _current_run is None:
-        raise RuntimeError("No active run. Call braven.init() first.")
-    _current_run.config(key, value, flush=flush)
-
-
-def summary(key: str, value, flush: bool = True) -> None:
-    """Log an output metric on the active run. See config()'s `flush`."""
-    if _current_run is None:
-        raise RuntimeError("No active run. Call braven.init() first.")
-    _current_run.summary(key, value, flush=flush)
-
-
-def flush() -> None:
-    """Send any pending flush=False config()/summary() values on the active
-    run now, in one PUT. No-op if nothing is pending."""
-    if _current_run is None:
-        raise RuntimeError("No active run. Call braven.init() first.")
-    _current_run.flush()
-
-
-def upload(path_or_fig, name: str | None = None, interactive: bool = True) -> None:
-    """Upload a file (or a live matplotlib Figure — see Run.upload) attached to the
-    current experiment. Works from either a direct-log run (after braven.init()) or a
-    pipeline script — same dual dispatch as plot_series(). In a pipeline script, goes
-    to the ambient current device's own child Experiment (see set_device()) if one is
-    set, else the parent.
-
-    `interactive=False` skips the companion-series extraction for a matplotlib
-    Figure — see Run.upload()."""
-    if _current_run is not None:
-        _current_run.upload(path_or_fig, name, interactive=interactive)
-    else:
-        _pipeline_upload(path_or_fig, name, device_key=_current_device_key, device_type=_current_device_type, interactive=interactive)
-
-
-def plot_series(
-    name: str,
-    y: list,
-    x: list | None = None,
-    x_label: str | None = None,
-    y_label: str | None = None,
-    mode: str = "line",
-) -> None:
-    """Log a labeled data series as an interactive plot. Works from either a direct-log
-    run (after braven.init()) or a pipeline script — call multiple times with the same
-    `name` and a distinct `y_label` to group traces onto one chart (multi-trace)."""
-    if _current_run is not None:
-        _current_run.plot_series(name, y, x=x, x_label=x_label, y_label=y_label, mode=mode)
-    else:
-        _pipeline_plot_series(name, y, x=x, x_label=x_label, y_label=y_label, mode=mode)
-
-
-def get_device(key: str, type: str | None = None) -> "Device":
-    """Return a device-scoped logging handle for `key`. Works from a direct run
-    (after braven.init()) or a pipeline script — same dual dispatch as
-    upload()/plot_series().
-
-        braven.get_device("SENSOR-4471").log_summary("SNR", 14.2)
-        braven.get_device("SENSOR-4471", "Photodiode").log_summary("SNR", 14.2)
-
-    The optional `type` names the device type to create the device under when
-    it's first seen; it's ignored for a device that already exists (a device is
-    resolved by its key alone and never re-typed). In a direct run the handle is
-    memoised on the run; in a pipeline it's a light stateless handle that writes
-    onto the pipeline metadata queue.
-
-    In a PIPELINE script (ADR-0013), this also resolves-or-creates the device's
-    own single-device child Experiment under the pipeline's Experiment (the
-    "parent") — log_config/log_summary/log_series/plot_series/upload on the
-    returned handle land on the child's own data, not a device-tagged row on
-    the parent. See set_device() for the ambient equivalent (no explicit
-    handle needed for every call)."""
-    if _current_run is not None:
-        return _current_run.get_device(key, type)
-    return Device(str(key), run=None, type=type)
-
-
-def device(key: str, type: str | None = None) -> "Device":
-    """REMOVED (0.2.0, ADR-0013) — use get_device(key, type) instead (same
-    signature, same return value — a drop-in rename), or set_device(key,
-    type) if you want subsequent bare log_config()/log_summary()/log_series()/
-    plot_series()/upload() calls to apply to that device without threading an
-    explicit handle through every call. Raises instead of silently keeping
-    device()'s old behavior: in a pipeline script, device()-tagged values used
-    to land on a shared row of the parent Experiment (Spec 04); get_device()
-    now gives that device its own child Experiment, a real behavior change
-    old scripts relying on the old fused-row shape (e.g. reading
-    `max_device_mismatch` against every device's row on one Experiment) would
-    otherwise silently break under."""
-    raise RuntimeError(
-        "braven.device() has been removed - use braven.get_device(key, type) for an explicit "
-        "handle, or braven.set_device(key, type) to make subsequent log_config()/log_summary()/"
-        "log_series()/plot_series()/upload() calls apply to that device ambiently. "
-        "braven.set_device(None) returns to experiment-level logging."
-    )
-
-
-def set_device(key: str | None, type: str | None = None) -> None:
-    """Set (or clear) the ambient current device for subsequent pipeline-script
-    calls to log_config()/log_summary()/log_series()/plot_series()/upload() —
-    the device-scoped equivalent of how braven.init() sets the ambient current
-    run (ADR-0013). Pipeline scripts only (mirrors get_device()'s "parent
-    Experiment" concept, which a direct-logging Run doesn't have).
-
-        braven.set_device("SENSOR-4471")
-        braven.log_summary("SNR", 14.2)   # this device's SNR, own child Experiment
-        braven.log_summary("SNR", 9.8)    # still SENSOR-4471 -- ambient, not per-call
-        braven.set_device(None)           # back to parent-level logging
-        braven.log_summary("max_device_mismatch", 3.1)  # parent-level again
-
-    `type` follows get_device()'s rule: applied only if the device is new,
-    ignored (never re-typing) for one that already exists. Pass key=None (or
-    call with no arguments) to clear back to parent-level logging — the same
-    as never having called set_device() at all. Reset automatically at the
-    start of each pipeline run (init_pipeline()), so a previous run's device
-    selection can never leak into a new one."""
-    global _current_device_key, _current_device_type
-    _current_device_key = str(key) if key is not None else None
-    _current_device_type = type if key is not None else None
-
-
-def finish() -> None:
-    """Flush metadata and close the active run."""
-    global _current_run
-    if _current_run is not None:
-        _current_run.finish()
-    _current_run = None
-
-
-# ---------------------------------------------------------------------------
-# Pipeline execution context (used inside worker-run scripts — unchanged)
-# ---------------------------------------------------------------------------
-
-braven_experiment_id: str | None = None
-braven_api_url: str | None = None
-braven_watcher_secret: str | None = None
-braven_user_id: str | None = None
-braven_pipeline_id: str | None = None
-
-# Streaming mode (2026-08-22, default ON): when true, log_config()/
-# log_summary() (Experiment-level, non-series) each send their own entry to
-# the backend immediately instead of only joining the buffered queue below —
-# see _pipeline_log() and _stream_one_entry(). log_series()/plot_series() and
-# any get_device(...)-scoped call are deliberately excluded regardless of this
-# flag — they stay exclusively on the buffered flush_metadata() path (see
-# _stream_one_entry's docstring for why). Toggle with
-# braven.init_pipeline(stream=False) / braven.init(stream=False).
-braven_stream: bool = True
-
-_metadata_queue: list[dict] = []
-
-# Device-scoped streaming (2026-08-22 follow-up — see _pipeline_log below).
-# Unlike Experiment-level entries (streamed one-by-one, _stream_one_entry),
-# a device-scoped log_config()/log_summary()/plot_series() call is buffered
-# here and flushed as a BATCH on a debounced cadence instead: a wafer-scale
-# run calls these hundreds-thousands of times (several per die), and even a
-# fast per-call round trip doesn't scale to that volume — the constraint is
-# call COUNT, not latency. DEVICE_STREAM_INTERVAL_S bounds how often a batch
-# goes out regardless of how fast dies are processed; the buffer keeps
-# accumulating between flushes so nothing is lost, and the final
-# flush_metadata() at run end remains the source of truth regardless (this
-# is a live-preview path, not the write of record).
-DEVICE_STREAM_INTERVAL_S = 2.0
-_device_stream_queue: list[dict] = []
-_device_stream_last_flush_at: float = 0.0
-
-# ADR-0013: the ambient current device set by set_device() — consulted by
-# log_config()/log_summary()/log_series()/plot_series()/upload() below so a
-# pipeline script can write several values for one device without threading
-# an explicit get_device() handle through every call. None ⇒ parent-level
-# (the default, and what set_device(None) returns to).
-_current_device_key: str | None = None
-_current_device_type: str | None = None
-
-# The run handle for the current pipeline (set by init_pipeline), so scripts can
-# use the same `run = braven.init(); run.get_device(...)` object model as direct
-# logging. See _PipelineRun and the adopt-first rule in init() (Spec 04 §6.1).
-_pipeline_run: "_PipelineRun | None" = None
-
-# Convenience dict populated by the executor: filename → local temp path
-files: dict[str, str] = {}
-
-# Extracted parameters populated by the executor before process() runs.
-# Keys are canonical names (from field mappings); raw key used as fallback.
-params: dict = {}
-
-# Column rename map populated by the mapping layer before process() runs.
-# Maps raw CSV column names to canonical names: {raw: canonical}
-column_maps: dict[str, str] = {}
+    if len(candidates) == 1:
+        return candidates[0]["id"]
+    if len(candidates) == 0:
+        available = ", ".join(f"{p.get('company_name')}/{p.get('name')}" for p in projects) or "(none)"
+        raise RuntimeError(f"No project matches company={company!r}, project={project!r}. Available: {available}")
+    available = ", ".join(f"{p.get('company_name')}/{p.get('name')}" for p in candidates)
+    raise RuntimeError(f"Multiple projects match company={company!r}, project={project!r}: {available}. Be more specific.")
 
 
 # ---------------------------------------------------------------------------
 # Local dry mode — pipeline scripts are normally written and iterated on
 # locally (`python script.py`) before being copy-pasted into the webapp
-# Pipeline editor. Historically, any pipeline-vocabulary call
-# (log_config/log_summary/log_series/log_artifact/upload/plot_series/
-# device()) raised RuntimeError the moment it ran outside the worker, since
-# nothing had configured an experiment/API context — breaking that
-# copy-paste loop. Now, when _ensure_pipeline_init() finds NEITHER
-# braven_experiment_id NOR braven_api_url resolvable (not via explicit
-# args, not via BRAVEN_* env vars), it returns ("", "") instead of raising,
-# and every write function below prints what it would have done instead.
+# Pipeline editor. `run = braven.init()` (bare, no worker around) resolves
+# nothing (no BRAVEN_* environment variables set), so every Run method
+# prints what it would have done instead of raising — see Run._local_dry_mode
+# and each method's local-dry-mode branch above.
 #
 # This can never fire inside a real worker run: worker/executor.py always
 # calls braven.init(experiment_id=..., api_url=..., ...) with explicit
 # keyword arguments before user code executes, and explicit arguments
-# already take precedence over every other source in init_pipeline()'s
-# resolution order. A *partially* configured context (one field resolves,
-# the other doesn't) is left alone — that's a real misconfiguration, not a
-# local script, and still raises exactly as before.
+# already take precedence over every other source above. A *partially*
+# configured context (one field resolves, the other doesn't) is left alone —
+# that's a real misconfiguration, not a local script, and still raises.
 #
 # See braven-mvp's docs/adr/0008-local-pipeline-dry-mode.md and
 # .scratch/local-pipeline-dry-mode/spec.md for the full design.
 # ---------------------------------------------------------------------------
-
-_LOCAL_OUTPUT_DIR = "braven_local_output"
-
-_CATEGORY_TO_LOG_FN = {"config": "log_config", "summary": "log_summary", "series": "log_series"}
-
-
-def _local_output_path(filename: str) -> Path:
-    """Next available path under ./braven_local_output/ for `filename`,
-    appending a numeric suffix on collision (figure_1.png, figure_2.png,
-    ...) rather than overwriting a previous local run's output — local
-    iteration commonly re-runs the same script repeatedly."""
-    out_dir = Path(_LOCAL_OUTPUT_DIR)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    candidate = out_dir / filename
-    if not candidate.exists():
-        return candidate
-    stem, suffix = candidate.stem, candidate.suffix
-    n = 1
-    while True:
-        candidate = out_dir / f"{stem}_{n}{suffix}"
-        if not candidate.exists():
-            return candidate
-        n += 1
-
-
-class _PipelineRun:
-    """Run handle returned by braven.init() inside a worker-run pipeline. Its
-    logging methods delegate to the module-level pipeline metadata queue, and
-    get_device() returns a device-scoped handle — so pipeline scripts can use
-    the same run/device object model as direct logging.
-
-        run = braven.init()                 # adopts the worker's experiment
-        run.log_summary("max_mismatch", 3)  # experiment-level
-        run.get_device("SENSOR-1").log_summary("SNR", 14.2)
-    """
-
-    def __init__(self, experiment_id: str | None) -> None:
-        self.id = experiment_id
-
-    def get_device(self, key: str, type: str | None = None) -> "Device":
-        return Device(str(key), run=None, type=type)
-
-    def log_config(self, key: str, value) -> None:
-        _pipeline_log(key, str(value), "config", device_key=_current_device_key, device_type=_current_device_type)
-
-    def log_summary(self, key: str, value) -> None:
-        _pipeline_log(key, str(value), "summary", device_key=_current_device_key, device_type=_current_device_type)
-
-    def log_series(self, key: str, values: list) -> None:
-        _pipeline_log(key, json.dumps(values), "series", device_key=_current_device_key, device_type=_current_device_type)
-
-    config = log_config
-    summary = log_summary
-
-    def plot_series(self, name: str, y: list, x: list | None = None, x_label: str | None = None, y_label: str | None = None, mode: str = "line") -> None:
-        _pipeline_plot_series(name, y, x=x, x_label=x_label, y_label=y_label, mode=mode)
-
-    def upload(self, path_or_fig, name: str | None = None, interactive: bool = True) -> None:
-        _pipeline_upload(path_or_fig, name, device_key=_current_device_key, device_type=_current_device_type, interactive=interactive)
-
-    def __repr__(self) -> str:
-        return f"Run(pipeline, id={self.id!r})"
-
-
-def init_pipeline(
-    experiment_id: str | None = None,
-    api_url: str | None = None,
-    watcher_secret: str | None = None,
-    user_id: str | None = None,
-    pipeline_id: str | None = None,
-    stream: bool | None = None,
-) -> "_PipelineRun":
-    """Initialise the pipeline execution context (called by the worker executor).
-
-    Prefer ``braven.init()`` for direct logging from your own scripts. Returns a
-    run handle bound to the pipeline's experiment.
-
-    ``stream`` (default: unchanged, i.e. stays at the module default of True)
-    controls whether log_config()/log_summary() write immediately or only join
-    the buffered end-of-run flush — see the ``braven_stream`` module doc above.
-    Pass ``None`` (the default) to leave whatever's already set untouched, same
-    as every other field here — only an explicit True/False changes it, so
-    _ensure_pipeline_init()'s internal no-args re-entry can never silently
-    reset a script's own stream=False choice back to the default.
-    """
-    global braven_experiment_id, braven_api_url, braven_watcher_secret
-    global braven_user_id, braven_pipeline_id, braven_stream, _metadata_queue, column_maps, params, _pipeline_run
-    global _current_device_key, _current_device_type
-    global _device_stream_queue, _device_stream_last_flush_at
-    if stream is not None:
-        braven_stream = stream
-    braven_experiment_id = experiment_id or braven_experiment_id or os.environ.get("BRAVEN_EXPERIMENT_ID")
-    braven_api_url = api_url or braven_api_url or os.environ.get("BRAVEN_API_URL")
-    braven_watcher_secret = (
-        watcher_secret
-        or braven_watcher_secret
-        or os.environ.get("BRAVEN_WATCHER_SECRET")
-        or os.environ.get("WATCHER_SECRET")
-    )
-    braven_user_id = user_id or braven_user_id or os.environ.get("BRAVEN_USER_ID")
-    if pipeline_id is not None:
-        braven_pipeline_id = pipeline_id
-    _metadata_queue = []
-    column_maps = {}
-    params = {}
-    # Reset only on a genuine new-run call (experiment_id explicitly passed —
-    # the worker's real, once-per-run entry point, executor.py's braven.init(
-    # experiment_id=..., ...)), not on _ensure_pipeline_init()'s internal
-    # auto-resolve re-entry (no args). In local dry mode, braven_experiment_id
-    # never resolves, so _ensure_pipeline_init() calls this on EVERY logging
-    # call — an unconditional reset here would silently clear set_device()'s
-    # ambient state after just one call, inside a single dry-mode script run.
-    if experiment_id is not None:
-        _current_device_key = None
-        _current_device_type = None
-        _device_stream_queue = []
-        _device_stream_last_flush_at = 0.0
-    _pipeline_run = _PipelineRun(braven_experiment_id)
-    return _pipeline_run
-
-
-def _ensure_pipeline_init() -> tuple[str, str]:
-    """Resolve the pipeline execution context, calling init_pipeline() first
-    to pick up BRAVEN_* env vars if nothing's set yet.
-
-    Returns (experiment_id, api_url) when a context is configured. Returns
-    ("", "") — local dry mode, see the section above — only when NEITHER
-    field resolves to anything; callers must check the returned
-    experiment_id and, if empty, print instead of making a network call. A
-    partially-configured context (one field resolves, the other doesn't)
-    is a real misconfiguration, not a local script, and still raises.
-    """
-    if not braven_experiment_id or not braven_api_url:
-        init_pipeline()
-    if not braven_experiment_id and not braven_api_url:
-        return "", ""
-    if not braven_experiment_id:
-        raise RuntimeError(
-            "braven experiment_id not set. The worker should have called braven.init_pipeline(), "
-            "or set BRAVEN_EXPERIMENT_ID in the environment."
-        )
-    if not braven_api_url:
-        raise RuntimeError(
-            "braven api_url not set. Set BRAVEN_API_URL in the environment."
-        )
-    return braven_experiment_id, braven_api_url
-
-
-def _pipeline_auth_headers() -> dict:
-    if not braven_watcher_secret:
-        return {}
-    return {"Authorization": f"Bearer {braven_watcher_secret}"}
-
-
-def log_config(key: str, value: str) -> None:
-    """Queue a config parameter for this pipeline run — for the ambient
-    current device (see set_device()) if one is set, else parent-level."""
-    _pipeline_log(key, value, "config", device_key=_current_device_key, device_type=_current_device_type)
-
-
-def log_summary(key: str, value: str) -> None:
-    """Queue a summary metric for this pipeline run — for the ambient current
-    device (see set_device()) if one is set, else parent-level."""
-    _pipeline_log(key, value, "summary", device_key=_current_device_key, device_type=_current_device_type)
-
-
-def log(key: str, value: str) -> None:
-    """REMOVED (2026-07-16) — the ambiguous log() alias is gone so scripts
-    state their intent explicitly. Raises with migration guidance instead of
-    an opaque AttributeError, since older stored pipeline scripts still call
-    it."""
-    raise RuntimeError(
-        "braven.log() has been removed - use braven.log_summary(key, value) "
-        "for output metrics or braven.log_config(key, value) for input parameters."
-    )
-
-
-def log_metadata(key: str, value: str) -> None:
-    """Alias for log_config() (kept for backwards compatibility)."""
-    _pipeline_log(key, value, "config", device_key=_current_device_key, device_type=_current_device_type)
 
 
 def path_params() -> dict:
@@ -1266,332 +1108,41 @@ def path_params() -> dict:
     return result
 
 
-def log_series(key: str, values: list) -> None:
-    """Queue a numeric data series (stored as JSON string) — for the ambient
-    current device (see set_device()) if one is set, else parent-level."""
-    _pipeline_log(key, json.dumps(values), "series", device_key=_current_device_key, device_type=_current_device_type)
+# Convenience dict populated by the executor: filename → local temp path
+files: dict[str, str] = {}
+
+# Extracted parameters populated by the executor before process() runs.
+# Keys are canonical names (from field mappings); raw key used as fallback.
+params: dict = {}
+
+# Column rename map populated by the mapping layer before process() runs.
+# Maps raw CSV column names to canonical names: {raw: canonical}
+column_maps: dict[str, str] = {}
 
 
-def _pipeline_plot_series(
-    name: str,
-    y: list,
-    x: list | None = None,
-    x_label: str | None = None,
-    y_label: str | None = None,
-    mode: str = "line",
-) -> None:
-    """Pipeline-context implementation backing the module-level plot_series()
-    dispatcher — for the ambient current device (see set_device()) if one is
-    set, else parent-level."""
-    for key, value, category in _build_plot_series_entries(name, y, x, x_label, y_label, mode):
-        _pipeline_log(key, value, category, device_key=_current_device_key, device_type=_current_device_type)
+# ---------------------------------------------------------------------------
+# Removed names — every logging call now goes through an explicit `run`
+# (see the module docstring). Raises with migration guidance instead of an
+# opaque AttributeError, since older stored pipeline scripts may still
+# reference these bare.
+# ---------------------------------------------------------------------------
+
+_REMOVED_AMBIENT_NAMES = {
+    "config", "summary", "series", "log_config", "log_summary", "log_series",
+    "plot_series", "upload", "log_artifact", "flush", "finish",
+    "get_device", "device", "set_device", "log", "log_plot", "log_metadata",
+}
 
 
-def _pipeline_log(key: str, value: str, category: str, device_key: str | None = None, device_type: str | None = None) -> None:
-    experiment_id, api_url = _ensure_pipeline_init()
-    if not experiment_id:  # local dry mode — see the section above
-        fn = _CATEGORY_TO_LOG_FN.get(category, "log_config")
-        suffix = f", device={device_key!r}" if device_key else ""
-        print(f"[braven:local] would {fn}({key!r}, {value!r}{suffix})", flush=True)
-        return
-    global _metadata_queue
-    # Dedup by (key, device_key): a device's value only replaces the same device's
-    # earlier value for that key, never another device's (Spec 04 long format).
-    _metadata_queue = [e for e in _metadata_queue if not (e["key"] == key and e.get("device_key") == device_key)]
-    _metadata_queue.append({"key": key, "value": str(value), "category": category, "device_key": device_key, "device_type": device_type})
-    if not braven_stream or category == "series":
-        return
-    # Experiment-level: stream this one entry immediately — see
-    # _stream_one_entry's docstring for why this is safe/cheap per call.
-    if device_key is None:
-        _stream_one_entry(experiment_id, api_url, key, str(value), category)
-        return
-    # Device-scoped: buffer + debounce — see _flush_device_stream_queue's
-    # docstring for why this can't be a per-call immediate write the way the
-    # Experiment-level case above is.
-    _queue_device_stream_entry(experiment_id, api_url, key, str(value), category, device_key, device_type)
-
-
-def _stream_one_entry(experiment_id: str, api_url: str, key: str, value: str, category: str) -> None:
-    """Best-effort immediate write for one Experiment-level, non-series entry
-    (streaming mode). Hits a separate, narrower endpoint than flush_metadata()
-    — PATCH .../pipeline-metadata/{id}, an incremental upsert scoped to just
-    this key — rather than that endpoint's PUT, which re-derives and rewrites
-    the WHOLE accumulated flush every call (O(total entries so far) per call,
-    O(n²) over a run — fine once at the end, not once per log statement).
-    Series entries are excluded from streaming and stay exclusively on the
-    buffered flush_metadata() path: Series lives in R2 (ADR-0001) as a
-    read-modify-write object, not a row — streaming those would mean a full
-    object write per log_series()/plot_series() call. Device-tagged entries
-    go through the SAME endpoint, but debounced+batched — see
-    _flush_device_stream_queue below, not this function.
-
-    Never raises: a transient failure here just means this value shows up
-    once the run finishes instead of live — flush_metadata() at run end is
-    still the source of truth and rewrites it correctly regardless.
-    """
-    if not braven_pipeline_id:
-        return
-    try:
-        resp = requests.patch(
-            f"{api_url.rstrip('/')}/experiments/{experiment_id}/pipeline-metadata/{braven_pipeline_id}",
-            json=[{"key": key, "value": value, "category": category}],
-            headers=_pipeline_auth_headers(),
-            timeout=15,
+def __getattr__(name: str):
+    if name in _REMOVED_AMBIENT_NAMES:
+        raise RuntimeError(
+            f"braven.{name}() has been removed — every logging call now goes through an "
+            f"explicit run: `run = braven.init(); run.{name}(...)`. In a pipeline script, "
+            f"`run = braven.init()` (no arguments) adopts the Experiment the platform "
+            f"already created."
         )
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"[braven] streaming flush skipped for {key!r}: {e}", flush=True)
-
-
-def _queue_device_stream_entry(
-    experiment_id: str, api_url: str, key: str, value: str, category: str, device_key: str, device_type: str | None
-) -> None:
-    """Buffer one device-scoped entry for the debounced flush and send the
-    batch once DEVICE_STREAM_INTERVAL_S has elapsed since the last one — see
-    that constant's module-level comment for why this is batched+debounced
-    rather than a per-call immediate write the way _stream_one_entry is for
-    Experiment-level entries. Bounds call volume, not latency: a wafer run
-    calling log_config()/log_summary() per die would otherwise mean
-    hundreds-thousands of streaming round trips regardless of how fast any
-    one of them is."""
-    global _device_stream_queue, _device_stream_last_flush_at
-    _device_stream_queue = [
-        e for e in _device_stream_queue if not (e["key"] == key and e.get("device_key") == device_key)
-    ]
-    _device_stream_queue.append(
-        {"key": key, "value": value, "category": category, "device_key": device_key, "device_type": device_type}
-    )
-    now = time.time()
-    if now - _device_stream_last_flush_at >= DEVICE_STREAM_INTERVAL_S:
-        _flush_device_stream_queue(experiment_id, api_url)
-        _device_stream_last_flush_at = now
-
-
-def _flush_device_stream_queue(experiment_id: str, api_url: str) -> None:
-    """Best-effort immediate write of every currently-buffered device-scoped
-    entry, in one PATCH — the batch may span several devices (whatever
-    accumulated since the last flush), each resolved to its own child
-    Experiment server-side (appendPipelineMetadataEntries, backend-ts).
-    Clears the buffer on success; a transient failure leaves entries queued
-    for the next debounce tick (or the final flush_metadata(), the source of
-    truth regardless) rather than dropping them. Never raises."""
-    global _device_stream_queue
-    if not _device_stream_queue or not braven_pipeline_id:
-        return
-    batch = _device_stream_queue
-    try:
-        resp = requests.patch(
-            f"{api_url.rstrip('/')}/experiments/{experiment_id}/pipeline-metadata/{braven_pipeline_id}",
-            json=batch,
-            headers=_pipeline_auth_headers(),
-            timeout=15,
-        )
-        resp.raise_for_status()
-        _device_stream_queue = []
-    except Exception as e:
-        print(f"[braven] device-scoped streaming flush skipped ({len(batch)} entries): {e}", flush=True)
-
-
-def _describe_device_report(report: dict) -> str:
-    """One-line human summary of what a flush created / flagged (Spec device-policy
-    ticket 06), e.g. 'created 2 new devices: S-1, S-2; 1 type mismatch: …'."""
-    parts = []
-    keys = report.get("createdDeviceKeys") or []
-    types = report.get("createdTypeNames") or []
-    mism = report.get("typeMismatches") or []
-    if keys:
-        parts.append(f"created {len(keys)} new device(s): {', '.join(keys)}")
-    if types:
-        parts.append(f"created {len(types)} new type(s): {', '.join(types)}")
-    if mism:
-        joined = "; ".join(f"{m.get('key')} said '{m.get('requested')}' but is '{m.get('stored')}'" for m in mism)
-        parts.append(f"{len(mism)} device type mismatch(es): {joined}")
-    return "; ".join(parts)
-
-
-def flush_metadata(pipeline_id: str | None = None) -> dict | None:
-    """Atomically replace all pipeline-scoped metadata (called by the executor).
-    Returns the backend's device created-report ({createdDeviceKeys,
-    createdTypeNames, typeMismatches}) so the worker can fold it into the run
-    result, and prints a human line to stdout when the run created/flagged
-    devices. Returns None when there's nothing to flush."""
-    experiment_id, api_url = _ensure_pipeline_init()
-    if not experiment_id:  # local dry mode — see the section above
-        print("[braven:local] flush_metadata() — nothing to flush (local dry mode)", flush=True)
-        return None
-    entries = list(_metadata_queue)
-    if not entries:
-        return None
-    pid = pipeline_id or braven_pipeline_id
-    if not pid:
-        raise RuntimeError("flush_metadata: pipeline_id is required")
-    resp = requests.put(
-        f"{api_url.rstrip('/')}/experiments/{experiment_id}/pipeline-metadata/{pid}",
-        json=entries,
-        headers=_pipeline_auth_headers(),
-        timeout=30,
-    )
-    resp.raise_for_status()
-    try:
-        report = resp.json().get("device_report")
-    except Exception:
-        report = None
-    if report:
-        desc = _describe_device_report(report)
-        if desc:
-            print(f"[braven] {desc}", flush=True)
-    return report
-
-
-def log_plot(fig, name: str) -> None:
-    """REMOVED (2026-07-16) — Plotly figure upload is gone; matplotlib is
-    the plotting API. Raises with migration guidance instead of an opaque
-    AttributeError, since older auto-generated pipeline scripts still call
-    it."""
-    raise RuntimeError(
-        "braven.log_plot() (Plotly) has been removed - use "
-        "braven.upload(fig, name) with a matplotlib Figure instead."
-    )
-
-
-def _pipeline_upload(path_or_fig, name: str | None = None, device_key: str | None = None, device_type: str | None = None, interactive: bool = True) -> None:
-    """Pipeline-mode twin of Run.upload(): upload a file (or a live
-    matplotlib Figure) attached to the current pipeline experiment — or, with
-    `device_key` set (Device.upload()/the ambient current device, ADR-0013),
-    to that device's own child Experiment; the backend resolves the child
-    from `device_key` server-side, same as it does for metadata's device_key.
-    For a Figure, the PNG is saved the same way fig.savefig() would, and
-    (when `interactive` is True, the default) an interactive companion series
-    is extracted from the figure's line/scatter data (best-effort — queued as
-    series metadata and written by the final flush_metadata(), never blocking
-    the upload itself)."""
-    fig = path_or_fig if _is_matplotlib_figure(path_or_fig) else None
-    if fig is not None:
-        upload_name = name or "figure.png"
-    else:
-        file_path = Path(path_or_fig)
-        if not file_path.exists():
-            raise FileNotFoundError(f"upload: file not found: {file_path}")
-        upload_name = name or file_path.name
-
-    experiment_id, api_url = _ensure_pipeline_init()
-    if not experiment_id:  # local dry mode — see the section above
-        suffix = f", device={device_key!r}" if device_key else ""
-        if fig is not None:
-            out_path = _local_output_path(upload_name)
-            fig.savefig(out_path, dpi=150, bbox_inches="tight")
-            print(f"[braven:local] saved figure to {out_path} (upload skipped{suffix})", flush=True)
-        else:
-            print(f"[braven:local] would upload({upload_name!r}{suffix})", flush=True)
-        return
-
-    tmp_path: Path | None = None
-    if fig is not None:
-        tmp_path = Path(tempfile.mktemp(suffix=".png"))
-        fig.savefig(tmp_path, dpi=150, bbox_inches="tight")
-        file_path = tmp_path
-
-    params: dict = {"experiment_id": experiment_id}
-    if braven_pipeline_id:
-        params["pipeline_id"] = braven_pipeline_id
-    if device_key:
-        params["device_key"] = device_key
-        if device_type:
-            params["device_type"] = device_type
-    with open(file_path, "rb") as fh:
-        resp = requests.post(
-            f"{api_url.rstrip('/')}/files",
-            files=_upload_file_parts(upload_name, fh, file_path),
-            params=params,
-            headers=_pipeline_auth_headers(),
-            timeout=120,
-        )
-    resp.raise_for_status()
-
-    if tmp_path is not None:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-
-    if fig is not None and interactive:
-        try:
-            groups = _walk_matplotlib_figure(fig)
-            base = _safe_filename_sdk(upload_name)
-            for g in groups:
-                for trace_idx, tr in enumerate(g["traces"]):
-                    prefix = f"mplplot::{base}::{g['axes_index']}::{trace_idx}"
-                    _pipeline_log(f"{prefix}::y", json.dumps(tr["y"]), "series", device_key=device_key, device_type=device_type)
-                    _pipeline_log(f"{prefix}::x", json.dumps(tr["x"]), "series", device_key=device_key, device_type=device_type)
-                    meta = {
-                        "mode": tr["mode"],
-                        "trace_label": tr["label"],
-                        "x_label": g["x_label"],
-                        "y_label": g["y_label"],
-                        "x_scale": g["x_scale"],
-                        "y_scale": g["y_scale"],
-                    }
-                    _pipeline_log(f"{prefix}::meta", json.dumps(meta), "series", device_key=device_key, device_type=device_type)
-        except Exception as e:
-            print(f"[braven] matplotlib series extraction skipped: {e}")
-
-
-def log_artifact(path: Union[str, Path], name: str | None = None) -> None:
-    """Upload a file attached to the current pipeline experiment."""
-    file_path = Path(path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"log_artifact: file not found: {file_path}")
-    upload_name = name or file_path.name
-
-    experiment_id, api_url = _ensure_pipeline_init()
-    if not experiment_id:  # local dry mode — see the section above
-        print(f"[braven:local] would log_artifact({upload_name!r})", flush=True)
-        return
-
-    params: dict = {"experiment_id": experiment_id}
-    if braven_pipeline_id:
-        params["pipeline_id"] = braven_pipeline_id
-    with open(file_path, "rb") as fh:
-        resp = requests.post(
-            f"{api_url.rstrip('/')}/files",
-            files=_upload_file_parts(upload_name, fh, file_path),
-            params=params,
-            headers=_pipeline_auth_headers(),
-            timeout=120,
-        )
-    resp.raise_for_status()
-
-
-# Keep the old `init` name working for pipeline scripts that call braven.init()
-# with keyword arguments matching the pipeline signature.
-_direct_init = init
-
-
-def init(*args, **kwargs):  # type: ignore[misc]
-    """Unified init: routes to init_pipeline() for pipeline scripts, or the
-    direct-logging init for standalone scripts.
-
-    Pipeline usage (called by worker executor):
-        braven.init(experiment_id="...", api_url="...", ...)
-
-    Direct-logging usage:
-        braven.init(name="My Experiment")
-
-    Adopt-first rule (Spec 04 §6.1): inside a worker-run pipeline the experiment
-    is pre-created by the worker, so a bare ``braven.init()`` in a user script
-    ADOPTS that existing experiment (returning its run handle) instead of POSTing
-    a new one — no credentials/project needed, and existing scripts that never
-    call init() are unaffected. (Creating additional experiments from one pipeline
-    is not supported yet; a repeat init() returns the same adopted run.)
-    """
-    pipeline_keys = {"experiment_id", "api_url", "watcher_secret", "user_id", "pipeline_id", "stream"}
-    if args or (kwargs and pipeline_keys.intersection(kwargs)):
-        return init_pipeline(*args, **kwargs)
-    # Bare init() while a pipeline context is active → adopt the pre-created run.
-    if braven_experiment_id and _pipeline_run is not None:
-        return _pipeline_run
-    return _direct_init(**kwargs)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # ---------------------------------------------------------------------------
