@@ -25,6 +25,7 @@ import matplotlib
 matplotlib.use("Agg")  # headless — no display needed to run these tests
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import pytest
 from PIL import Image
 
@@ -275,6 +276,51 @@ def test_build_plot_series_entries_coerces_numpy_values():
 
 
 # ---------------------------------------------------------------------------
+# Table (braven-mvp's ADR-0016) — table()/_build_table_entry()
+# ---------------------------------------------------------------------------
+
+
+def test_pandas_dtype_to_table_type_maps_common_kinds():
+    df = pd.DataFrame({
+        "i": [1, 2], "f": [1.5, 2.5], "b": [True, False],
+        "s": ["a", "b"], "t": pd.to_datetime(["2026-01-01", "2026-01-02"]),
+    })
+    assert braven._pandas_dtype_to_table_type(df["i"].dtype) == "int"
+    assert braven._pandas_dtype_to_table_type(df["f"].dtype) == "float"
+    assert braven._pandas_dtype_to_table_type(df["b"].dtype) == "bool"
+    assert braven._pandas_dtype_to_table_type(df["s"].dtype) == "string"
+    assert braven._pandas_dtype_to_table_type(df["t"].dtype) == "datetime"
+
+
+def test_table_payload_from_dataframe_shape():
+    df = pd.DataFrame({"cycle": [1, 2], "voltage": [3.7, 3.6]})
+    payload = braven._table_payload_from_dataframe(df)
+    assert payload["columns"] == [
+        {"name": "cycle", "type": "int"}, {"name": "voltage", "type": "float"}
+    ]
+    assert payload["rows"] == [[1, 3.7], [2, 3.6]]
+
+
+def test_table_payload_from_dataframe_nulls_become_none():
+    df = pd.DataFrame({"x": [1.0, float("nan")]})
+    payload = braven._table_payload_from_dataframe(df)
+    assert payload["rows"] == [[1.0], [None]]
+
+
+def test_table_payload_from_dataframe_rejects_non_dataframe():
+    with pytest.raises(TypeError, match="pandas DataFrame"):
+        braven._table_payload_from_dataframe({"not": "a dataframe"})
+
+
+def test_build_table_entry_shape():
+    df = pd.DataFrame({"cycle": [1]})
+    key, value, category = braven._build_table_entry("readings", df)
+    assert key == "readings"
+    assert category == "table"
+    assert json.loads(value) == {"columns": [{"name": "cycle", "type": "int"}], "rows": [[1]]}
+
+
+# ---------------------------------------------------------------------------
 # _load_config / _prompt_login — wandb-style first-use login prompt.
 # Every test redirects braven._CONFIG_PATH into pytest's tmp_path, so none of
 # these ever touch the real ~/.braven/config.json.
@@ -399,6 +445,26 @@ def test_series_with_no_context_prints_instead_of_raising(reset_pipeline_context
     assert "would series" in capsys.readouterr().out
 
 
+def test_table_with_no_context_prints_a_shape_summary_not_the_full_json(reset_pipeline_context, monkeypatch, capsys):
+    _no_network(monkeypatch)
+    run = braven.init()
+
+    run.table("readings", pd.DataFrame({"cycle": [1, 2, 3]}))
+
+    out = capsys.readouterr().out
+    assert "would table('readings', '<DataFrame 3x1>')" in out
+    assert '"columns"' not in out  # never dumps the serialized payload
+
+
+def test_log_table_is_an_alias_for_table(reset_pipeline_context, monkeypatch):
+    run = braven.init(experiment_id="exp_123", api_url="https://api.example.com")
+
+    run.log_table("readings", pd.DataFrame({"cycle": [1]}))
+
+    assert (None, "readings") in run._metadata
+    assert run._metadata[(None, "readings")]["category"] == "table"
+
+
 def test_set_device_logging_with_no_context_prints_and_tags_device(reset_pipeline_context, monkeypatch, capsys):
     _no_network(monkeypatch)
     run = braven.init()
@@ -410,7 +476,7 @@ def test_set_device_logging_with_no_context_prints_and_tags_device(reset_pipelin
 
 
 def test_removed_ambient_names_raise_with_migration_guidance(reset_pipeline_context):
-    for name in ("device", "get_device", "log_config", "log_summary", "set_device", "upload"):
+    for name in ("device", "get_device", "log_config", "log_summary", "set_device", "upload", "table", "log_table"):
         with pytest.raises(RuntimeError, match="run\\."):
             getattr(braven, name)
 
@@ -654,6 +720,16 @@ def test_streaming_skips_series_entries(reset_pipeline_context, monkeypatch):
 
     assert len(run._metadata) == 1
     assert next(iter(run._metadata.values()))["category"] == "series"
+
+
+def test_streaming_skips_table_entries(reset_pipeline_context, monkeypatch):
+    run = _pipeline_run(monkeypatch)
+    _no_network(monkeypatch)  # table stays on the buffered path — no per-call R2 write
+
+    run.table("readings", pd.DataFrame({"cycle": [1, 2]}))
+
+    assert len(run._metadata) == 1
+    assert next(iter(run._metadata.values()))["category"] == "table"
 
 
 def test_streaming_failure_is_swallowed_not_raised(reset_pipeline_context, monkeypatch, capsys):

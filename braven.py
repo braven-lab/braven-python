@@ -36,6 +36,7 @@ PIPELINE SCRIPTS (run by the Braven worker)
     run.config("lr", "0.001")
     run.summary("acc", "0.94")
     run.upload("plot.png")
+    run.table("readings", dataframe)   # named, columnar Table (pandas)
 
     # `run = braven.init()` also makes local iteration work: run the same
     # script standalone (`python script.py`, no worker) before pasting it
@@ -214,6 +215,75 @@ def _build_plot_series_entries(
     meta = {"mode": mode, "trace_label": y_label, "x_label": x_label, "y_label": y_label}
     entries.append((f"{prefix}::meta", json.dumps(meta), "series"))
     return entries
+
+
+# ---------------------------------------------------------------------------
+# Table (braven-mvp's CONTEXT.md/ADR-0016) — named, columnar Run output
+# distinct from series() (numeric x/y traces only): can mix column types,
+# logged wholesale via table(name, dataframe). Pandas stays an optional
+# dependency (`pip install braven[dataframe]`), same instinct as matplotlib
+# below — never imported at module load time.
+# ---------------------------------------------------------------------------
+
+
+def _pandas_dtype_to_table_type(dtype) -> str:
+    """Map a pandas dtype to one of Table's column types (int/float/string/
+    bool/datetime) — see braven-mvp's backend-ts/tableBundle.ts for the
+    matching set on the receiving end."""
+    kind = getattr(dtype, "kind", "O")
+    if kind in ("i", "u"):
+        return "int"
+    if kind == "f":
+        return "float"
+    if kind == "b":
+        return "bool"
+    if kind == "M":
+        return "datetime"
+    return "string"
+
+
+def _table_payload_from_dataframe(dataframe) -> dict:
+    """Convert a pandas DataFrame into the {columns, rows} JSON payload
+    table() sends. Column names/types are read directly off the DataFrame's
+    own columns/dtypes — no separate hand-declared schema, the same
+    pivot-off-a-well-known-object pattern upload() uses for a live
+    matplotlib Figure."""
+    try:
+        import pandas as pd
+    except ImportError:
+        raise ImportError("pandas required for table(): pip install braven[dataframe]")
+    if not isinstance(dataframe, pd.DataFrame):
+        raise TypeError(f"table() expects a pandas DataFrame, got {type(dataframe).__name__}")
+
+    columns = [{"name": str(c), "type": _pandas_dtype_to_table_type(dataframe[c].dtype)} for c in dataframe.columns]
+
+    def cell(value, col_type: str):
+        try:
+            is_na = bool(pd.isna(value))
+        except (TypeError, ValueError):
+            is_na = False
+        if is_na:
+            return None
+        if col_type == "int":
+            return int(value)
+        if col_type == "float":
+            return float(value)
+        if col_type == "bool":
+            return bool(value)
+        if col_type == "datetime":
+            return value.isoformat()
+        return str(value)
+
+    col_types = [c["type"] for c in columns]
+    rows = [[cell(row[i], col_types[i]) for i in range(len(columns))] for row in dataframe.itertuples(index=False, name=None)]
+    return {"columns": columns, "rows": rows}
+
+
+def _build_table_entry(name: str, dataframe) -> tuple[str, str, str]:
+    """Build the (key, value, category) triple table() sends — the whole
+    Table rides one generic log-entry, same wire mechanism config()/
+    summary()/series() already use (no new ingestion endpoint)."""
+    return (name, json.dumps(_table_payload_from_dataframe(dataframe)), "table")
 
 
 # ---------------------------------------------------------------------------
@@ -615,6 +685,19 @@ class Run:
 
     log_series = series  # deprecated alias
 
+    def table(self, name: str, dataframe) -> None:
+        """Log a named, columnar Table (targets the parent Experiment, or the
+        device set by set_device() if one is active) — a pandas DataFrame,
+        column names/types read directly off it. Distinct from series()
+        (numeric x/y traces only): a Table can mix column types. Replaces
+        any prior Table of the same `name` on this Experiment wholesale.
+        Requires pandas: `pip install braven[dataframe]`."""
+        key, value, category = _build_table_entry(name, dataframe)
+        self._log(key, value, category, display=f"<DataFrame {dataframe.shape[0]}x{dataframe.shape[1]}>")
+
+    log_table = table  # alias — no plain log_ predecessor to deprecate here,
+    # kept for naming parity with config/summary/series's log_x aliases
+
     def plot_series(
         self,
         name: str,
@@ -740,25 +823,36 @@ class Run:
     # Internals
     # ------------------------------------------------------------------
 
-    def _record(self, key: str, value, category: str, device_key: str | None, device_type: str | None) -> None:
+    def _record(
+        self, key: str, value, category: str, device_key: str | None, device_type: str | None, display=None
+    ) -> None:
         """Buffer one entry into self._metadata (and print the local-dry-mode
-        line if applicable). Pure bookkeeping — never sends anything."""
+        line if applicable). Pure bookkeeping — never sends anything.
+        `display`, when given, replaces `value` in the printed line only —
+        table() uses this so local-dry-mode printing shows a short shape
+        summary instead of dumping the whole serialized Table JSON."""
         self._metadata[(device_key, key)] = {
             "key": key, "value": str(value), "category": category,
             "device_key": device_key, "device_type": device_type,
         }
         if self._local_dry_mode:
+            shown = value if display is None else display
             suffix = f", device={device_key!r}" if device_key else ""
-            print(f"[braven:local] would {category}({key!r}, {value!r}{suffix})", flush=True)
+            print(f"[braven:local] would {category}({key!r}, {shown!r}{suffix})", flush=True)
 
-    def _log(self, key: str, value, category: str) -> None:
+    def _log(self, key: str, value, category: str, display=None) -> None:
         device_key, device_type = self._device_target, self._device_target_type
-        self._record(key, value, category, device_key, device_type)
+        self._record(key, value, category, device_key, device_type, display=display)
         if self._mode == "created":
             if self._auto_flush:
                 self._flush()
             return
-        if self._local_dry_mode or not self._auto_flush or category == "series":
+        # table stays on the buffered flush() path, same as series — a
+        # per-call streaming write here would mean a full R2 write on every
+        # table() call (ADR-0016 in braven-mvp); appendPipelineMetadataEntries
+        # drops table-categorized entries server-side for the same reason, so
+        # skipping the round trip here is purely avoiding wasted network.
+        if self._local_dry_mode or not self._auto_flush or category in ("series", "table"):
             return
         if device_key is None:
             # Parent-level: stream this one entry immediately — best-effort
@@ -1129,6 +1223,7 @@ column_maps: dict[str, str] = {}
 
 _REMOVED_AMBIENT_NAMES = {
     "config", "summary", "series", "log_config", "log_summary", "log_series",
+    "table", "log_table",
     "plot_series", "upload", "log_artifact", "flush", "finish",
     "get_device", "device", "set_device", "log", "log_plot", "log_metadata",
 }

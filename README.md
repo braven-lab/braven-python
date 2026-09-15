@@ -78,14 +78,32 @@ Prefer to log a plain array without a matplotlib figure at all?
 run.plot_series("snr_vs_temp", y=snr_values, x=temperatures, x_label="Temp (C)", y_label="SNR (dB)")
 ```
 
+## Tables — named, columnar data
+
+`series()`/`plot_series()` are numeric x/y traces only. For a table that
+mixes column types (strings, dates, mixed numeric columns), log a pandas
+DataFrame wholesale with `table()` — column names and types are read
+directly off the DataFrame:
+
+```python
+import pandas as pd
+
+df = pd.DataFrame({"cycle": [1, 2, 3], "voltage": [3.7, 3.6, 3.5], "note": ["ok", "ok", "fade"]})
+run.table("cycling_data", df)
+```
+
+Calling `table()` again with the same name replaces the whole prior Table on
+that Experiment. Requires pandas: `pip install braven[dataframe]`.
+
 ## Devices — multiple sensors/units in one run
 
 Tag a value with a stable per-device key and the KPI name stays the same
 across devices (no `SNR_dev1`, `SNR_dev2`) — the device becomes a separate
 coordinate instead of a suffix. `set_device()` retargets `run` onto that
 device's own child Experiment (ADR-0013) — every `config()`/`summary()`/
-`series()`/`plot_series()`/`upload()` call after it lands there instead of
-the parent, until `set_device(None)` returns `run` to parent-level:
+`series()`/`plot_series()`/`table()`/`upload()` call after it lands there
+instead of the parent, until `set_device(None)` returns `run` to
+parent-level:
 
 ```python
 for sensor_id, snr in results.items():
